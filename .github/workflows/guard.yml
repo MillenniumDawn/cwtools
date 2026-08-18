@@ -80,7 +80,9 @@ jobs:
       # match, so neither side reaches the other's entries. No `save-always`:
       # it is a deprecated no-op at this pin, so a run that fails after the
       # build saves nothing and the next one rebuilds. The release profile is
-      # thin-LTO at one codegen unit, hence the hour.
+      # thin-LTO at one codegen unit, hence the hour. This tier is the only one
+      # that writes these entries, because it is the only one that checks out
+      # nothing but this repository.
       - name: Cache cargo release target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -232,8 +234,14 @@ jobs:
         # stable
         uses: "dtolnay/rust-toolchain@29eef336d9b2848a0b54\
           8edc03f92a220660cdb8"
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore-only, here and in the corpus tier. Both check out repositories
+      # this one does not own, and a job that does that must not be able to
+      # write the cache every other job restores from. The vanilla tier checks
+      # out nothing but this repository, so it is the one that populates these
+      # entries; a run that finds them cold rebuilds, which is what all three
+      # do on the first run after a lockfile change anyway.
+      - name: Restore cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -241,8 +249,8 @@ jobs:
           key: >-
             ${{ runner.os }}-cargo-registry-${{
             hashFiles('cwtools-rs/Cargo.lock') }}
-      - name: Cache cargo release target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cargo release target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: cwtools-rs/target
           key: >-
@@ -311,8 +319,9 @@ jobs:
         # stable
         uses: "dtolnay/rust-toolchain@29eef336d9b2848a0b54\
           8edc03f92a220660cdb8"
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore-only, for the reason the Millennium Dawn tier spells out.
+      - name: Restore cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -320,8 +329,8 @@ jobs:
           key: >-
             ${{ runner.os }}-cargo-registry-${{
             hashFiles('cwtools-rs/Cargo.lock') }}
-      - name: Cache cargo release target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cargo release target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: cwtools-rs/target
           key: >-
