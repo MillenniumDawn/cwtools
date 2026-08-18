@@ -1099,6 +1099,29 @@ impl Backend {
             )
         };
         for (uri, text, version, current_ast) in open_docs {
+            if self.is_ignored_uri(&uri) {
+                self.clear_ignored_file_state(&uri);
+                self.update_doc_tokens(&uri, None);
+                let still_current = {
+                    let docs = self.state.documents.lock();
+                    docs.get(&uri)
+                        .map(|d| d.version == version)
+                        .unwrap_or(false)
+                };
+                if !still_current {
+                    continue;
+                }
+                if let Ok(uri_obj) = Url::parse(&uri) {
+                    self.publish_filtered(
+                        uri_obj,
+                        Vec::new(),
+                        Some(version),
+                        Some(cwtools_cache::workspace::content_hash(&text)),
+                    )
+                    .await;
+                }
+                continue;
+            }
             let diagnostics = match current_ast {
                 Some(ast) => {
                     // Prebuilt path: validate the stored AST against the complete

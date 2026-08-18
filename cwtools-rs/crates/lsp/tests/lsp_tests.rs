@@ -15367,3 +15367,148 @@ fn test_loc_rename_updates_dollar_refs_in_yml() {
         uris
     );
 }
+
+#[test]
+fn test_ignored_file_is_not_validated_on_open_and_after_config_change() {
+    // Repro from #323: ignored file is clean while closed and must stay clean
+    // when opened, and adding a glob while the file is open must clear its
+    // diagnostics instead of leaving stale squiggles.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), COMPLETION_RULES).unwrap();
+    // Two decision files with an undefined <focus> reference (CW500) and one
+    // engine-baseline file (README.txt) that must also stay clean.
+    let decision_text =
+        "decision = { id = t; allowed = { has_completed_focus = missing_focus } }\n";
+    std::fs::create_dir_all(ws.path().join("common/decisions")).unwrap();
+    std::fs::write(ws.path().join("common/decisions/kept.txt"), decision_text).unwrap();
+    std::fs::write(
+        ws.path().join("common/decisions/ignored.txt"),
+        decision_text,
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("common/decisions/later.txt"), decision_text).unwrap();
+    std::fs::write(ws.path().join("README.txt"), decision_text).unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    // ignoreFilePatterns: ignored.txt (user glob) — README.txt is baseline.
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "ignoreFilePatterns": ["ignored.txt"]
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).expect("init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // Workspace scan must finish before didOpen; wait for kept.txt diagnostics.
+    wait_for_diagnostics(&mut reader, "kept.txt");
+
+    // Helper: wait for publishDiagnostics for suffix and return its diagnostics array.
+    let mut wait_publish = |suffix: &str| -> serde_json::Value {
+        for _ in 0..400 {
+            let raw = read_frame(&mut reader).expect("read frame");
+            if raw.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                && v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with(suffix))
+            {
+                return v["params"]["diagnostics"].clone();
+            }
+        }
+        panic!("no publishDiagnostics for {suffix}");
+    };
+
+    // Open ignored, README (baseline), and later (currently kept). The two ignored
+    // must publish empty, later must publish CW500.
+    for rel in [
+        "common/decisions/ignored.txt",
+        "README.txt",
+        "common/decisions/later.txt",
+    ] {
+        let path = ws.path().join(rel);
+        let uri = path_uri(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didOpen",
+                serde_json::json!({"textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": text}}),
+            ),
+        )
+        .unwrap();
+    }
+    let ignored_diags = wait_publish("ignored.txt");
+    assert!(
+        ignored_diags.as_array().is_some_and(|a| a.is_empty()),
+        "ignored.txt must publish empty diagnostics when opened, got: {ignored_diags}"
+    );
+    let readme_diags = wait_publish("README.txt");
+    assert!(
+        readme_diags.as_array().is_some_and(|a| a.is_empty()),
+        "README.txt (engine baseline) must publish empty when opened, got: {readme_diags}"
+    );
+    let later_diags = wait_publish("later.txt");
+    assert!(
+        later_diags.as_array().is_some_and(|a| !a.is_empty()),
+        "later.txt must publish diagnostics before it is ignored, got: {later_diags}"
+    );
+
+    // Now add later.txt to the ignore list while it is still open. The open
+    // buffer must clear its diagnostics (publish empty) instead of keeping stale
+    // squiggles until the tab is closed.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({"settings": {"ignoreFilePatterns": ["ignored.txt", "later.txt"]}}),
+        ),
+    )
+    .unwrap();
+    // The config change triggers revalidate_all_open_docs; wait for later.txt to go empty.
+    let mut later_cleared = serde_json::json!([]);
+    for _ in 0..400 {
+        let raw = read_frame(&mut reader).expect("read frame");
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with("later.txt"))
+        {
+            later_cleared = v["params"]["diagnostics"].clone();
+            if later_cleared.as_array().is_some_and(|a| a.is_empty()) {
+                break;
+            }
+        }
+    }
+    assert!(
+        later_cleared.as_array().is_some_and(|a| a.is_empty()),
+        "later.txt must clear diagnostics after being added to ignoreFilePatterns while open, got: {later_cleared}"
+    );
+    child.kill().ok();
+}

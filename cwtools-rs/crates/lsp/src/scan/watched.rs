@@ -181,7 +181,11 @@ impl Backend {
     /// handling on that path. Below the cap, deletions apply first (one
     /// `info_service` write), then per-file validation. Re-arms if new events
     /// landed while it was running.
-    async fn process_watched_batch(&self, changes: HashSet<String>, deletes: Vec<String>) {
+    pub(crate) async fn process_watched_batch(
+        &self,
+        changes: HashSet<String>,
+        deletes: Vec<String>,
+    ) {
         let mut lost_scan_cas = false;
         if watched_batch_over_cap(changes.len(), deletes.len()) {
             tracing::info!(
@@ -214,6 +218,7 @@ impl Backend {
             {
                 let to_insert: Vec<String> = changes
                     .iter()
+                    .filter(|uri| !self.is_ignored_uri(uri))
                     .filter_map(|uri| self.workspace_rel_for_file_index(uri))
                     .collect();
                 if !to_insert.is_empty() {
@@ -231,6 +236,13 @@ impl Backend {
             // (#90).
             let mut changed_loc_keys: HashSet<String> = HashSet::new();
             for uri in changes {
+                if self.is_ignored_uri(&uri) {
+                    self.clear_ignored_file_state(&uri);
+                    if let Ok(uri_obj) = Url::parse(&uri) {
+                        self.publish_filtered(uri_obj, Vec::new(), None, None).await;
+                    }
+                    continue;
+                }
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
                 if self.state.documents.lock().contains_key(&uri) {
@@ -343,7 +355,7 @@ impl Backend {
     /// Workspace-relative path for FileIndex bookkeeping, if `uri` is under
     /// the workspace root and inside the access boundary. `None` for vanilla
     /// files or URIs outside the boundary.
-    fn workspace_rel_for_file_index(&self, uri: &str) -> Option<String> {
+    pub(crate) fn workspace_rel_for_file_index(&self, uri: &str) -> Option<String> {
         let root = self.state.config.read().workspace_roots.first().cloned()?;
         let abs = self.authorized_path(uri)?;
         let rel = abs.strip_prefix(&root).ok()?;
