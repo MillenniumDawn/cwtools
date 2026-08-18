@@ -41,7 +41,7 @@ fn fnv1a_digest(parts: [&str; 4]) -> String {
 fn relative_file(file: &str, root: &Path) -> String {
     let mut file = file.replace('\\', "/");
     let root_str = root.to_string_lossy().replace('\\', "/");
-    if let Some((drive, _)) = root_str.split_once(':')
+    if let Some(drive) = drive_letter(&root_str)
         && !file.contains(':')
         && let Some(rest) = file.strip_prefix('/')
     {
@@ -51,6 +51,16 @@ fn relative_file(file: &str, root: &Path) -> String {
         Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
         Err(_) => file,
     }
+}
+
+/// The drive letter `path` starts with (`C` in `C:/repo/mod`), or `None`. A
+/// colon anywhere else is part of a directory name, which is legal on Unix,
+/// and reading it as a drive would rewrite paths that have nothing to do with
+/// Windows.
+fn drive_letter(path: &str) -> Option<char> {
+    let mut chars = path.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    (chars.next() == Some(':')).then_some(drive)
 }
 
 /// Stable digest of a diagnostic, for baseline/ignore matching. Keyed on the
@@ -523,6 +533,22 @@ mod tests {
         assert_eq!(
             relative_file(&outside, &root),
             relative_file(&outside, &root)
+        );
+    }
+
+    /// A colon in the root names a directory, which is legal on Unix; only a
+    /// leading `X:` is a drive. Reading any colon as one rewrote every file
+    /// outside the root before hashing it, so a vanilla path picked up a
+    /// prefix built from the mod's own name.
+    #[test]
+    fn relative_file_reads_only_a_leading_drive_letter() {
+        let root = PathBuf::from(abs("repo/my:mod"));
+        let outside = abs("vanilla/common/x.txt");
+        assert_eq!(relative_file(&outside, &root), outside, "outside the root");
+        assert_eq!(
+            relative_file(&abs("repo/my:mod/common/x.txt"), &root),
+            "common/x.txt",
+            "under the root"
         );
     }
 
