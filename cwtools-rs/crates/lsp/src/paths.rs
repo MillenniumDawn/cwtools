@@ -16,10 +16,78 @@ pub(crate) fn uri_to_path_str(uri: &str) -> String {
 /// Convert a filesystem path to a `file://` URI, percent-encoding special
 /// characters. Uses the `url` crate so paths with spaces or non-ASCII round-trip
 /// correctly through `uri_to_path_str`.
+///
+/// This is the canonical spelling every index keys on; see
+/// [`canonical_uri`] for why that matters.
 pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
     Url::from_file_path(path)
         .map(|u| u.to_string())
         .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
+/// Fold a client-supplied URI to the spelling [`path_to_uri`] produces.
+///
+/// Every index the server keeps — `documents`, `InfoService::files`,
+/// `TypeIndex::file_positions`, the loc overlays, the semantic-token cache —
+/// is a map keyed on the raw URI string, and `InfoService::clear_file` drops a
+/// file's previous contribution by that same string. So one file reaching the
+/// server under two spellings is indexed twice and never de-duplicated.
+///
+/// That is not hypothetical: VS Code percent-encodes the Windows drive colon
+/// (`file:///d%3A/mod/x.txt`) while the workspace scan builds its keys with
+/// `Url::from_file_path` (`file:///d:/mod/x.txt`), and the `url` crate decodes
+/// neither into the other. The scan's "skip documents the editor already has
+/// open" guard is a string compare, so on Windows it never matched: every open
+/// file was indexed a second time from disk, and CW261 reported every instance
+/// of a `## unique` type in it as defined twice.
+///
+/// Returns the input unchanged for anything that is not a convertible `file:`
+/// URI (untitled buffers, virtual documents), so those keep working as before.
+///
+/// Percent-encoding is the only spelling difference folded here. Windows drive
+/// letter *case* is not: `Config::workspace_roots` comes from the client's own
+/// workspace-folder URI, so the scan's paths already inherit whatever case the
+/// client uses for documents, and normalising it would change every URI the
+/// server emits on Windows for a mismatch no real client produces.
+pub(crate) fn canonical_uri(uri: &str) -> String {
+    if let Ok(url) = Url::parse(uri)
+        && let Some(canonical) = canonical_url(&url)
+    {
+        return canonical.into();
+    }
+    uri.to_string()
+}
+
+/// The canonical form of `url`, or `None` when it is already canonical or is
+/// not a `file:` URI that converts to a path. See [`canonical_uri`].
+fn canonical_url(url: &Url) -> Option<Url> {
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    let canonical = path_to_uri(&path);
+    if canonical == url.as_str() {
+        return None;
+    }
+    Url::parse(&canonical).ok()
+}
+
+/// In-place [`canonical_uri`] for a URI arriving inside request params, applied
+/// at the `LanguageServer` boundary so no handler ever keys on a client's own
+/// spelling. A no-op when the URI is already canonical.
+pub(crate) fn canonicalize_url(url: &mut Url) {
+    if let Some(canonical) = canonical_url(url) {
+        *url = canonical;
+    }
+}
+
+/// [`canonicalize_url`] for the workspace-edit params, whose URIs are plain
+/// `String`s rather than `Url`s.
+pub(crate) fn canonicalize_uri_string(uri: &mut String) {
+    let canonical = canonical_uri(uri);
+    if *uri != canonical {
+        *uri = canonical;
+    }
 }
 
 /// Normalized, decoded workspace path prefix for [`logical_path_from_uri`],
@@ -950,6 +1018,78 @@ mod tests {
         let ws = Some(workspace_prefix_of("file:///home/user/My%20Mod"));
         let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
+    }
+
+    // ── canonical_uri (#317) ──────────────────────────────────────────────
+
+    /// The spelling VS Code sends on Windows. `to_file_path` decodes `%3A` on
+    /// both platforms (`d:\a\b.txt` there, `/d:/a/b.txt` here) and
+    /// `from_file_path` re-encodes neither the colon nor the separator, so the
+    /// canonical form is the same string either way and this test is portable.
+    #[test]
+    fn canonical_uri_decodes_the_percent_encoded_drive_colon() {
+        assert_eq!(
+            canonical_uri("file:///d%3A/a/b.txt"),
+            "file:///d:/a/b.txt",
+            "the VS Code spelling must fold onto the path_to_uri spelling"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_is_idempotent_and_matches_path_to_uri() {
+        #[cfg(not(windows))]
+        let path = std::path::Path::new("/home/user/My Mod/events/foo.txt");
+        #[cfg(windows)]
+        let path = std::path::Path::new(r"d:\Users\user\My Mod\events\foo.txt");
+        let canonical = path_to_uri(path);
+        assert_eq!(canonical_uri(&canonical), canonical);
+        // A space stays percent-encoded; canonicalising must not decode it into
+        // an invalid URI.
+        assert!(canonical.contains("%20"), "got: {canonical}");
+    }
+
+    #[test]
+    fn canonical_uri_passes_through_what_it_cannot_convert() {
+        // Not a URI at all, and a scheme with no filesystem path behind it.
+        assert_eq!(canonical_uri("not a uri"), "not a uri");
+        assert_eq!(
+            canonical_uri("untitled:Untitled-1"),
+            "untitled:Untitled-1",
+            "untitled buffers have no path and must survive unchanged"
+        );
+    }
+
+    /// Percent-encoding of an ordinary path byte folds the same way on every
+    /// platform, which is what makes the end-to-end test in `lsp_tests.rs`
+    /// portable.
+    #[test]
+    fn canonical_uri_decodes_an_encoded_path_letter() {
+        assert_eq!(canonical_uri("file:///a/%64up.txt"), "file:///a/dup.txt");
+    }
+
+    /// Drive-letter case is deliberately left alone; see `canonical_uri`.
+    #[cfg(windows)]
+    #[test]
+    fn canonical_uri_preserves_drive_letter_case() {
+        assert_eq!(canonical_uri("file:///D:/a/b.txt"), "file:///D:/a/b.txt");
+        assert_eq!(canonical_uri("file:///D%3A/a/b.txt"), "file:///D:/a/b.txt");
+    }
+
+    #[test]
+    fn canonicalize_url_rewrites_in_place() {
+        let mut url: Url = "file:///d%3A/a/b.txt".parse().unwrap();
+        canonicalize_url(&mut url);
+        assert_eq!(url.as_str(), "file:///d:/a/b.txt");
+        // Second application changes nothing.
+        canonicalize_url(&mut url);
+        assert_eq!(url.as_str(), "file:///d:/a/b.txt");
+    }
+
+    #[test]
+    fn canonicalize_uri_string_rewrites_in_place() {
+        let mut uri = "file:///d%3A/a/b.txt".to_string();
+        canonicalize_uri_string(&mut uri);
+        assert_eq!(uri, "file:///d:/a/b.txt");
     }
 
     // ── strip_loc_comment (#50) ───────────────────────────────────────────

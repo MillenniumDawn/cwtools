@@ -274,6 +274,102 @@ fn test_lsp_unknown_notification_does_not_crash() {
     assert_eq!(resp["id"], 99);
 }
 
+// ── Client URI spellings fold onto one index key (#317) ──────────────────────
+
+/// A client may spell a `file:` URI differently from `Url::from_file_path`
+/// without naming a different file — VS Code percent-encodes the Windows drive
+/// colon (`file:///d%3A/…`), and percent-encoding is legal for any path byte.
+/// Every index the server keeps is a map on the raw URI string, so a spelling
+/// it does not fold is a second key for a file it already has: the workspace
+/// scan's "skip documents the editor has open" guard misses, the file is
+/// indexed twice, and CW261 reports every instance of a `## unique` type in it
+/// as defined twice.
+///
+/// Encoding a plain letter (`dup.txt` → `%64up.txt`) exercises the same fold on
+/// every platform; the drive-letter half is covered by the `paths` unit tests.
+#[test]
+fn test_did_open_folds_a_percent_encoded_uri_onto_the_canonical_one() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+
+    let rel_path = "common/decisions/dup.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    let text = "my_decision = {\n    cost = 5\n}\n";
+    std::fs::write(&file_path, text).unwrap();
+
+    let canonical_uri = path_uri(&file_path);
+    // The client's spelling: same file, `d` written as `%64`.
+    let client_uri = canonical_uri.replace("dup.txt", "%64up.txt");
+    assert_ne!(client_uri, canonical_uri, "the spellings must differ");
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": client_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+
+    // The URI the diagnostics come back under is the key the document was
+    // indexed under, so it is what proves the fold happened.
+    let mut published = None;
+    for _ in 0..400 {
+        let raw = match read_frame(&mut reader) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "textDocument/publishDiagnostics"
+            && let Some(u) = v["params"]["uri"].as_str()
+            && u.ends_with("up.txt")
+        {
+            published = Some(u.to_string());
+            break;
+        }
+    }
+    child.kill().ok();
+
+    assert_eq!(
+        published.as_deref(),
+        Some(canonical_uri.as_str()),
+        "did_open must key the document by the canonical URI, not the client's spelling"
+    );
+}
+
 // ── Context-aware completion round-trips ─────────────────────────────────────
 
 /// Rules covering both regressions from cwtools-vscode#11: trigger aliases
