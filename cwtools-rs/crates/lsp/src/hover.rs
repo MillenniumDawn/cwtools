@@ -398,18 +398,32 @@ pub(crate) fn build_hover_markdown(
 /// decisions and similar entities the token IS the loc key, and the `<key>_desc`
 /// entry holds the description tooltip. The cwt config doesn't model this, so it
 /// can't be resolved through the rule walk.
+///
+/// Quoted leaf values (`"DEN_Maersk1"`) carry the surrounding `"…"` through
+/// `leaf_value_to_string`; the loc index stores bare keys, so strip the quotes
+/// before lookup. Without this a `value[...]` reference like
+/// `has_country_flag = "my_war_flag"` fails to preview its localisation, since
+/// `"my_war_flag"` is not a key in the loc map (#317).
 pub(crate) fn append_localisation(
     md: &mut String,
     element: &PositionElement,
     loc_text: &LocTextMap,
 ) {
+    let loc_key = |s: &str| {
+        let s = s.trim();
+        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+            s[1..s.len() - 1].to_lowercase()
+        } else {
+            s.to_lowercase()
+        }
+    };
     let (name_key, desc_key): (Option<String>, Option<String>) = match element {
         PositionElement::Leaf { key, value } if value.is_empty() => {
-            let k = key.to_lowercase();
+            let k = loc_key(key);
             (Some(k.clone()), Some(format!("{k}_desc")))
         }
-        PositionElement::Leaf { value, .. } => (Some(value.to_lowercase()), None),
-        PositionElement::LeafValue { value } => (Some(value.to_lowercase()), None),
+        PositionElement::Leaf { value, .. } => (Some(loc_key(value)), None),
+        PositionElement::LeafValue { value } => (Some(loc_key(value)), None),
     };
     let mut emit = |loc_key: &str, label: &str| {
         if let Some(translations) = loc_text.get(loc_key) {
@@ -805,5 +819,73 @@ mod tests {
         assert!(!md.contains("**Prev**"), "got: {}", md);
         assert!(md.contains("**From**: country"), "got: {}", md);
         assert!(!md.contains("**From.From**"), "got: {}", md);
+    }
+
+    fn loc_map_with(pairs: &[(&str, &str)]) -> LocTextMap {
+        let mut m = LocTextMap::default();
+        for (k, v) in pairs {
+            m.insert(
+                std::sync::Arc::<str>::from(*k),
+                vec![(cwtools_localization::Lang::English, (*v).to_string())],
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn test_append_localisation_strips_quoted_value() {
+        // #317: a quoted leaf value (`"my_war_flag"`) carries the surrounding
+        // quotes through `leaf_value_to_string`. The loc index stores bare
+        // keys, so the lookup must strip them; otherwise `value[...]`-shaped
+        // references like `has_country_flag = "my_war_flag"` never preview
+        // their loc.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: "\"my_war_flag\"".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(md.contains("War Flag"), "got: {}", md);
+        assert!(md.contains("**Localisation**"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_unquoted_still_works() {
+        // The unquoted path keeps working: `name = my_idea` (LocalisationField
+        // cases already passed, but assert the bare-key path explicitly so the
+        // quote-stripping fix doesn't regress it).
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "name".to_string(),
+                value: "my_idea".to_string(),
+            },
+            &loc_map_with(&[("my_idea", "My Idea")]),
+        );
+        assert!(md.contains("My Idea"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_strips_quoted_definition_key() {
+        // A quoted key on a definition-side leaf (the key IS the loc key for
+        // ideas/decisions) must also be unquoted before lookup.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "\"my_great_idea\"".to_string(),
+                value: String::new(),
+            },
+            &loc_map_with(&[
+                ("my_great_idea", "Great Idea"),
+                ("my_great_idea_desc", "It is great."),
+            ]),
+        );
+        assert!(md.contains("Great Idea"), "got: {}", md);
+        assert!(md.contains("It is great."), "got: {}", md);
     }
 }
