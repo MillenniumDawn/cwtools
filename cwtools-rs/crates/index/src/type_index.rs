@@ -1385,4 +1385,138 @@ mod tests {
             "a genuinely-missing sibling must not resolve"
         );
     }
+
+    // ── VarIndex vanilla provenance (#306) ────────────────────────────────────
+
+    #[test]
+    fn var_index_vanilla_set_makes_contains_true() {
+        let mut vi = VarIndex::new();
+        assert!(vi.is_empty());
+        vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
+        assert!(vi.contains("vanilla_var"));
+        assert!(vi.contains("VANILLA_VAR"), "contains is case-insensitive");
+        assert!(!vi.is_empty());
+        assert_eq!(vi.len(), 1);
+    }
+
+    #[test]
+    fn var_index_vanilla_normalizes_and_skips_empty() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec![
+            "\"quoted_var\"".to_string(),
+            "foo.bar^2".to_string(),
+            "my_var?100".to_string(),
+            "my_var@GER".to_string(),
+            "   ".to_string(),
+            "".to_string(),
+        ]);
+        assert!(vi.contains("quoted_var"));
+        assert!(vi.contains("bar"), "last dot-segment is the key");
+        assert!(vi.contains("my_var"), "? and @ suffixes are stripped");
+        assert_eq!(
+            vi.len(),
+            3,
+            "empty strings must be skipped, dup my_var collapsed"
+        );
+    }
+
+    #[test]
+    fn var_index_vanilla_len_union_does_not_double_count_shared() {
+        let mut vi = VarIndex::new();
+        vi.add_name("shared_var");
+        vi.set_vanilla_names(vec!["shared_var".to_string(), "vanilla_only".to_string()]);
+        assert!(vi.contains("shared_var"));
+        assert!(vi.contains("vanilla_only"));
+        assert_eq!(vi.len(), 2, "shared name counts once");
+        assert!(!vi.is_empty());
+    }
+
+    #[test]
+    fn var_index_vanilla_loc_bindable_includes_vanilla() {
+        let mut idx = TypeIndex::new();
+        idx.var_index
+            .set_vanilla_names(vec!["vanilla_loc_var".to_string()]);
+        let names: HashSet<String> = idx.loc_bindable_names().collect();
+        assert!(
+            names.contains("vanilla_loc_var"),
+            "vanilla vars must be loc-bindable, got {:?}",
+            names
+        );
+        idx.var_index.add_name("mod_var");
+        let names2: HashSet<String> = idx.loc_bindable_names().collect();
+        assert!(names2.contains("mod_var"));
+        assert!(names2.contains("vanilla_loc_var"));
+    }
+
+    #[test]
+    fn var_index_vanilla_survives_clear_file_on_shared_name() {
+        let mut vi = VarIndex::new();
+        vi.add_name("shared_var");
+        vi.set_vanilla_names(vec!["shared_var".to_string()]);
+        vi.remove_name("shared_var");
+        assert!(
+            vi.contains("shared_var"),
+            "vanilla must survive a mod clear_file on same name"
+        );
+        assert_eq!(vi.len(), 1);
+    }
+
+    #[test]
+    fn var_index_vanilla_remerge_replaces_not_accumulates() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["old_var".to_string()]);
+        assert!(vi.contains("old_var"));
+        vi.set_vanilla_names(vec!["new_var".to_string()]);
+        assert!(
+            !vi.contains("old_var"),
+            "re-merge must replace, not accumulate"
+        );
+        assert!(vi.contains("new_var"));
+        assert_eq!(vi.len(), 1);
+    }
+
+    #[test]
+    fn var_index_vanilla_clear_drops_it() {
+        let mut vi = VarIndex::new();
+        vi.add_name("mod_var");
+        vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
+        vi.clear_vanilla_names();
+        assert!(!vi.contains("vanilla_var"));
+        assert!(vi.contains("mod_var"));
+        assert!(!vi.is_empty());
+        vi.clear_vanilla_names();
+        assert!(vi.contains("mod_var"), "second clear is idempotent");
+    }
+
+    #[test]
+    fn var_index_vanilla_empty_vector_clears_previous() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["a".to_string()]);
+        vi.set_vanilla_names(vec![]);
+        assert!(!vi.contains("a"));
+        assert!(vi.is_empty());
+    }
+
+    #[test]
+    fn var_index_merge_does_not_copy_vanilla_names() {
+        let mut vanilla = VarIndex::new();
+        vanilla.set_vanilla_names(vec!["vanilla_only".to_string()]);
+        let mut mod_idx = VarIndex::new();
+        mod_idx.merge(&vanilla);
+        assert!(
+            !mod_idx.contains("vanilla_only"),
+            "merge copies only mod names, vanilla stays separate"
+        );
+    }
+
+    #[test]
+    fn var_index_all_names_dedups_shared() {
+        let mut vi = VarIndex::new();
+        vi.add_name("shared");
+        vi.set_vanilla_names(vec!["shared".to_string(), "vanilla".to_string()]);
+        let all: HashSet<String> = vi.all_names().cloned().collect();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains("shared"));
+        assert!(all.contains("vanilla"));
+    }
 }

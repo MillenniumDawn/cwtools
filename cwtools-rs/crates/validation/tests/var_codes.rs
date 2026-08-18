@@ -389,3 +389,78 @@ fn other_loop_variant_seeds_implicit_vars() {
     let c = loop_codes("foo = { while_loop = { use_var = v } }");
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
 }
+
+// ── Issue #306: base-game variables must resolve in the LSP (#306) ───────────
+// The vanilla cache carries `var_names` and the LSP stages them into
+// `var_index.vanilla_names`. A read of a vanilla-only variable must not flag
+// CW246, even though no mod file defines it.
+
+fn codes_with_vanilla(script: &str, vanilla: &[&str], vars: &[&str]) -> Vec<String> {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(RULES, &table);
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string(script, &table);
+    let mut idx = TypeIndex::new();
+    idx.var_index
+        .set_vanilla_names(vanilla.iter().map(|s| s.to_string()).collect());
+    for v in vars {
+        idx.var_index.add_name(v);
+    }
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/foo/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: Some(&idx),
+            modifier_keys: None,
+            loc_index: None,
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: true,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+#[test]
+fn vanilla_only_variable_is_clean_for_cw246() {
+    let c = codes_with_vanilla("foo = { ref = vanilla_var }", &["vanilla_var"], &[]);
+    assert!(
+        !c.contains(&"CW246".to_string()),
+        "vanilla var must resolve, got: {:?}",
+        c
+    );
+}
+
+#[test]
+fn vanilla_var_case_insensitive_is_clean() {
+    let c = codes_with_vanilla("foo = { ref = VANILLA_VAR }", &["vanilla_var"], &[]);
+    assert!(
+        !c.contains(&"CW246".to_string()),
+        "vanilla lookup is case-insensitive, got: {:?}",
+        c
+    );
+}
+
+#[test]
+fn undefined_still_flags_when_only_other_vanilla_var_exists() {
+    let c = codes_with_vanilla("foo = { ref = mystery }", &["other_vanilla"], &[]);
+    assert!(c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn mod_and_vanilla_both_resolve_and_dedup() {
+    let c = codes_with_vanilla(
+        "foo = { ref = shared_var }",
+        &["shared_var"],
+        &["shared_var"],
+    );
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
