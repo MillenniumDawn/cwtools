@@ -888,4 +888,112 @@ mod tests {
         assert!(md.contains("Great Idea"), "got: {}", md);
         assert!(md.contains("It is great."), "got: {}", md);
     }
+
+    #[test]
+    fn test_append_localisation_strips_quoted_leaf_value_variant() {
+        // Bare values (`LeafValue`) take the same path. A quoted leaf value
+        // there must also be unquoted before the loc lookup.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::LeafValue {
+                value: "\"my_war_flag\"".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(md.contains("War Flag"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_quoted_case_insensitive() {
+        // Loc keys are lowercased. Quoted upper-case must still resolve.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: "\"MY_WAR_FLAG\"".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(md.contains("War Flag"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_outer_whitespace_with_quotes() {
+        // Parser-adjacent whitespace is trimmed before quote detection. A value
+        // that arrives as ` "my_war_flag" ` should still preview.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: " \"my_war_flag\" ".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(md.contains("War Flag"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_mismatched_quote_not_stripped() {
+        // Only a balanced pair of surrounding double-quotes is stripped. A
+        // single leading or trailing quote stays verbatim and must not
+        // spuriously match the bare loc key.
+        let loc = loc_map_with(&[("my_war_flag", "War Flag")]);
+        for bad in [
+            "\"my_war_flag",
+            "my_war_flag\"",
+            "\"my_war_flag'",
+            "'my_war_flag\"",
+        ] {
+            let mut md = String::new();
+            append_localisation(
+                &mut md,
+                &PositionElement::Leaf {
+                    key: "has_country_flag".to_string(),
+                    value: bad.to_string(),
+                },
+                &loc,
+            );
+            assert!(
+                !md.contains("War Flag"),
+                "mismatched quotes {bad:?} should not match, got: {}",
+                md
+            );
+        }
+    }
+
+    #[test]
+    fn test_append_localisation_empty_quoted_no_panic() {
+        // `""` strips to "" and looks up the empty key. Must not panic and
+        // must not produce a localisation section.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: "\"\"".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(!md.contains("War Flag"), "got: {}", md);
+        assert!(!md.contains("**Localisation**"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_missing_key_no_section() {
+        // Unknown loc key leaves md untouched. Guards against false positives
+        // where any non-empty hover would be mistaken for a localisation preview.
+        let mut md = String::from("prefix");
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: "\"unknown_flag\"".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert_eq!(md, "prefix", "got: {}", md);
+    }
 }
