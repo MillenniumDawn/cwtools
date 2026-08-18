@@ -1113,7 +1113,11 @@ mod tests {
     #[test]
     fn canonical_uri_folds_every_drive_letter_spelling_onto_one_key() {
         let canonical = canonical_uri("file:///d%3A/a/b.txt");
-        for spelling in ["file:///D%3A/a/b.txt", "file:///d:/a/b.txt", "file:///D:/a/b.txt"] {
+        for spelling in [
+            "file:///D%3A/a/b.txt",
+            "file:///d:/a/b.txt",
+            "file:///D:/a/b.txt",
+        ] {
             assert_eq!(
                 canonical_uri(spelling),
                 canonical,
@@ -1173,7 +1177,10 @@ mod tests {
     fn a_canonical_folder_prefix_strips_a_document_whatever_case_the_client_used() {
         for folder in ["file:///d%3A/mod", "file:///D%3A/mod", "file:///D:/mod"] {
             let prefix = Some(workspace_prefix_of(&canonical_uri(folder)));
-            for doc in ["file:///d%3A/mod/events/foo.txt", "file:///D:/mod/events/foo.txt"] {
+            for doc in [
+                "file:///d%3A/mod/events/foo.txt",
+                "file:///D:/mod/events/foo.txt",
+            ] {
                 assert_eq!(
                     logical_path_from_uri(&canonical_uri(doc), &prefix),
                     "events/foo.txt",
