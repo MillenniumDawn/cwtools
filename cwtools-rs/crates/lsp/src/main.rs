@@ -656,6 +656,17 @@ impl LanguageServer for Backend {
             self.loc_watched_overlay_mut().remove(&uri);
         }
 
+        if self.is_ignored_uri(&uri) {
+            self.clear_ignored_file_state(&uri);
+            self.update_doc_tokens(&uri, None);
+            self.invalidate_semantic_tokens(&uri);
+            if let Ok(url) = Url::parse(&uri) {
+                self.publish_filtered(url, Vec::new(), Some(version), None)
+                    .await;
+            }
+            return;
+        }
+
         // Offload validation off the message future so a burst of opens can't
         // hold the bounded request queue (#90). `debounced_validate`'s
         // export-diff-gated dependent sweep replaces the old inline sweep here:
@@ -707,6 +718,17 @@ impl LanguageServer for Backend {
             return;
         }
 
+        if self.is_ignored_uri(&uri) {
+            self.clear_ignored_file_state(&uri);
+            self.update_doc_tokens(&uri, None);
+            self.invalidate_semantic_tokens(&uri);
+            if let Ok(url) = Url::parse(&uri) {
+                self.publish_filtered(url, Vec::new(), Some(version), None)
+                    .await;
+            }
+            return;
+        }
+
         // Bump the global edit counter so any in-flight dependent sweep from an
         // earlier edit knows it has been superseded and can stop early.
         let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -730,6 +752,21 @@ impl LanguageServer for Backend {
         canonicalize_url(&mut params.text_document.uri);
         let uri = params.text_document.uri.to_string();
         self.invalidate_semantic_tokens(&uri);
+        if self.is_ignored_uri(&uri) {
+            let version = {
+                let docs = self.state.documents.lock();
+                docs.get(&uri).map(|d| d.version)
+            };
+            self.clear_ignored_file_state(&uri);
+            self.update_doc_tokens(&uri, None);
+            if let (Some(version), Ok(url)) = (version, Url::parse(&uri)) {
+                self.publish_filtered(url, Vec::new(), Some(version), None)
+                    .await;
+            } else if let Ok(url) = Url::parse(&uri) {
+                self.publish_filtered(url, Vec::new(), None, None).await;
+            }
+            return;
+        }
         // A save isn't an edit, so don't bump the edit counter, just re-read the
         // current version and generation. Offload the validation like did_change
         // (#90); the entry version guard in `debounced_validate` makes a racing

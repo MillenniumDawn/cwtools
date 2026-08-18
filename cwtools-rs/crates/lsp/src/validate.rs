@@ -635,6 +635,65 @@ impl Backend {
         }
     }
 
+    /// True if `uri` would be excluded by the workspace scan (engine baseline
+    /// plus `ignoreFilePatterns`). Uses the same predicate as
+    /// `walk_workspace_files` via `is_ignored_logical_path`.
+    pub(crate) fn is_ignored_uri(&self, uri: &str) -> bool {
+        let (extra, ws_prefix) = {
+            let cfg = self.state.config.read();
+            (
+                cfg.ignore_file_patterns.clone(),
+                cfg.workspace_prefix.clone(),
+            )
+        };
+        let logical = logical_path_from_uri(uri, &ws_prefix);
+        cwtools_file_manager::file_manager::is_ignored_logical_path(&logical, &extra)
+    }
+
+    /// Clear all index state for `uri` as if it had never been indexed: type
+    /// index, variable/event exports, per-doc token set, `<type>` use tracking,
+    /// and both loc overlays. The workspace scan left an ignored file out, so
+    /// an ignored open document must not leave definitions visible to files
+    /// the scan says cannot see them.
+    pub(crate) fn clear_ignored_file_state(&self, uri: &str) {
+        let bump_info = {
+            let mut info = self.state.info_service.write();
+            let before = info.export_fingerprint(uri);
+            info.clear_file(uri);
+            info.export_fingerprint(uri) != before
+        };
+        self.state.doc_tokens.write().remove(uri);
+        let dropped: std::collections::HashSet<String> = {
+            let mut store = self.state.type_uses.write();
+            store
+                .remove(uri)
+                .map(|uses| {
+                    uses.changed_names(&Default::default())
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if !dropped.is_empty() {
+            self.state
+                .type_uses_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.state.pending_changed_names.lock().extend(dropped);
+        }
+        let loc_removed = self.state.loc_live_overlay.write().remove(uri).is_some()
+            || self.state.loc_watched_overlay.write().remove(uri).is_some();
+        self.state.watched_signatures.lock().remove(uri);
+        if let Some(rel) = self.workspace_rel_for_file_index(uri) {
+            let mut info = self.state.info_service.write();
+            if !info.type_index.file_index.is_empty() {
+                info.type_index.file_index.remove(&rel);
+            }
+        }
+        if bump_info || loc_removed {
+            self.bump_info_revision();
+        }
+    }
+
     /// Index an already-parsed AST into the info index, so the workspace scan
     /// can index cache-hit ASTs without re-parsing.
     ///
@@ -652,6 +711,13 @@ impl Backend {
         parsed: &ParsedFile,
         parsed_version: Option<i32>,
     ) {
+        // Defensive: an ignored file must never enter the type index. The
+        // workspace scan left it out, so indexing it on open would make its
+        // definitions visible to files the scan says cannot see them.
+        if self.is_ignored_uri(uri) {
+            self.clear_ignored_file_state(uri);
+            return;
+        }
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(uri, &ws_prefix);
         // Snapshot the ruleset instead of holding `rules` across the write: the
@@ -727,6 +793,9 @@ impl Backend {
         registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
         lines: &DocLines,
     ) -> Vec<Diagnostic> {
+        if self.is_ignored_uri(uri) {
+            return Vec::new();
+        }
         // Overlay computed before the other guards (its lock is independent and
         // never nested inside info/loc — see validate_loc_text).
         let overlay = self.loc_overlay_keys();
@@ -1140,7 +1209,7 @@ impl Backend {
         // Capture each dependent's text (an `Arc` bump) while the docs lock is
         // held so the republished diagnostics get whole-line squiggles and
         // encoded columns, same as the edited file.
-        let others: Vec<(String, i32, Arc<ParsedFile>, Arc<str>)> = {
+        let mut others: Vec<(String, i32, Arc<ParsedFile>, Arc<str>)> = {
             let tokens = self.state.doc_tokens.read();
             let docs = self.state.documents.lock();
             docs.iter()
@@ -1161,6 +1230,9 @@ impl Backend {
                 })
                 .collect()
         };
+        // Defensive: never revalidate an ignored document. The scan left it
+        // out, so its definitions must stay invisible.
+        others.retain(|(uri, _, _, _)| !self.is_ignored_uri(uri));
         if others.is_empty() {
             return;
         }
@@ -1541,6 +1613,11 @@ impl Backend {
         trigger: crate::ValidateTrigger,
         parsed_version: Option<i32>,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
+        if self.is_ignored_uri(uri) {
+            self.clear_ignored_file_state(uri);
+            self.update_doc_tokens(uri, None);
+            return (Vec::new(), None);
+        }
         let mut diagnostics = Vec::new();
         // Per-line text + negotiated encoding, so every squiggle spans the whole
         // statement line and lands on the columns the client reads.

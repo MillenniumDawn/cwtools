@@ -1268,6 +1268,32 @@ pub fn ignore_glob_match(pattern: &str, name: &str, relative: &str) -> bool {
     }
 }
 
+/// True if `logical_path` (root-relative, forward-slashed) is excluded by the
+/// engine baseline or `extra_file_globs`. Shared by the workspace walk and the
+/// LSP's open-document gate so they agree on what is ignored.
+pub fn is_ignored_logical_path(logical_path: &str, extra_file_globs: &[String]) -> bool {
+    let cfg = FileManagerConfig::default();
+    let file_name = logical_path.rsplit('/').next().unwrap_or(logical_path);
+    cfg.exclude_patterns
+        .iter()
+        .any(|pat| ignore_glob_match(pat, file_name, logical_path))
+        || extra_file_globs
+            .iter()
+            .any(|pat| ignore_glob_match(pat, file_name, logical_path))
+}
+
+/// True if the file at `path` under `root` would be excluded by the engine
+/// baseline plus `extra_file_globs`. Convenience wrapper that derives the
+/// logical path from `root`.
+pub fn is_ignored_file(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    extra_file_globs: &[String],
+) -> bool {
+    let logical = compute_logical_path(path, root);
+    is_ignored_logical_path(&logical, extra_file_globs)
+}
+
 /// Path-aware glob: `**` spans any run of directories (including none), while
 /// `*` and `?` stay inside one segment. That segment boundary is the whole
 /// reason this can't be [`glob_match`] over the joined path, where `*` would
