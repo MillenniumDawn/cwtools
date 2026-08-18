@@ -131,11 +131,15 @@ The workflow refuses a lightweight tag, and refuses one whose commit is not an
 ancestor of `origin/main`, both before anything builds. That is defense in
 depth. What actually stops a bad tag is the `release-tags` ruleset, which holds
 `refs/tags/v*` to signed tags and restricts creation, update, deletion and
-non-fast-forward. So the tag has to be signed, not merely annotated, and that
+non-fast-forward. So the tag wants to be signed, not merely annotated, and that
 needs `user.signingkey` set locally with the key registered on the GitHub
 account as a signing key. SSH counts: `gpg.format ssh` with the public key path
-as the signing key. A repo admin can bypass the ruleset, which is worth knowing
-about and not worth using.
+as the signing key.
+
+Nothing is set up to sign on the maintainer's machine today, so the tag goes up
+annotated but unsigned, on the repo-admin bypass, and `git tag -a` is what
+actually gets run. The signature rule stays aspirational until a signing key is
+configured. Worth fixing, since a bypass used every release is not a control.
 
 Dry run before the tag. `gh workflow run release.yml --ref <branch>` builds all
 three platforms and runs the release tests off a branch, and publishing is gated
