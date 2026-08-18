@@ -35,5 +35,5 @@ exec "$script_dir/corpus-guard.sh" \
   --corpus "$fixture/mod" \
   --rules "$fixture/rules" \
   --vanilla "$fixture/vanilla" \
-  --baseline "$script_dir/vanilla-baseline.csv" \
+  --baseline "${CWTOOLS_BASELINE:-$script_dir/vanilla-baseline.csv}" \
   "$@"

@@ -27,9 +27,11 @@ projects=${CWTOOLS_PROJECTS:-$HOME/Documents/github-projects}
 
 # --corpus rather than CWTOOLS_CORPUS: an exported one is almost always
 # pointing at Kaiserreich, and reading it here would validate that mod against
-# this baseline and report the whole thing as drift.
+# this baseline and report the whole thing as drift. CWTOOLS_BASELINE is the
+# other way round: passing --baseline unconditionally would swallow it, and
+# writing the before-baseline somewhere else is exactly what it is for.
 export CWTOOLS_GUARD_NAME=md-guard.sh
 exec "$script_dir/corpus-guard.sh" \
   --corpus "$projects/Millennium-Dawn" \
-  --baseline "$script_dir/md-baseline.csv" \
+  --baseline "${CWTOOLS_BASELINE:-$script_dir/md-baseline.csv}" \
   "$@"

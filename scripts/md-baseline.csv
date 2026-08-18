@@ -5284,6 +5284,8 @@ events/DPR.txt,270,Information,CW272,This is a deprecated command. Use add_count
 events/Denmark.txt,385,Information,CW272,"This is an deprecated command. Uadd_field_marshal_role instead when possible. The created field marshal will not be able to have a portrait if assigned to be a minister via officer corps, causing errors."
 events/Denmark.txt,395,Information,CW272,"This is an deprecated command. use add_corps_commander_role instead when possible. The created corps commander will not be able to have a portrait if assigned to be a minister via officer corps, causing errors."
 events/Denmark.txt,425,Information,CW272,This is a deprecated command. Use add_country_leader_role instead when possible.
+events/EU_events.txt,167,Error,CW267,"Expected a desc value, got EUevent.5.d"
+events/EU_events.txt,215,Error,CW267,"Expected a desc value, got EUevent.7.d"
 events/EU_news.txt,526,Error,CW267,"Expected a desc value, got EU_news.52.d"
 events/Econ_events.txt,1880,Error,CW226,"Localisation key ""bankruptcy.1.d"" uses command ""debt_bailout_display"" which doesn't exist"
 events/Econ_events.txt,2052,Error,CW226,"Localisation key ""bankruptcy.2.d"" uses command ""debt_bailout_display"" which doesn't exist"

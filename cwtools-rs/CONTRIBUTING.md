@@ -117,7 +117,7 @@ touches those six codes.
 One real mod is one mod's worth of coverage, and the two big HOI4 mods do not
 write the same script. The third tier validates
 [Millennium Dawn](https://github.com/MillenniumDawn/Millennium-Dawn) against a
-baseline of its own (`scripts/md-baseline.csv`, 11564 diagnostics as of
+baseline of its own (`scripts/md-baseline.csv`, 11566 diagnostics as of
 writing):
 
 ```sh
