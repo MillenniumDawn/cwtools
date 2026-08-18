@@ -120,18 +120,22 @@ Cutting X.Y.Z:
    picks up the 15 member entries, and stage the lockfile with the manifest.
    Leaving it behind ships binaries that name the previous release.
 3. Land both through a PR. `main` is protected, and the tag has to point into it.
-4. Tag the merged commit, annotated, and push the tag:
+4. Tag the merged commit, signed and annotated, and push the tag:
 
 ```plaintext
-git tag -a vX.Y.Z -m vX.Y.Z
+git tag -s -a vX.Y.Z -m vX.Y.Z
 git push origin vX.Y.Z
 ```
 
 The workflow refuses a lightweight tag, and refuses one whose commit is not an
-ancestor of `origin/main`, both before anything builds. It is defense in depth:
-the real control is the ruleset on `refs/tags/v*`. Signing (`git tag -s -a`) is
-the policy, but the runner holds no key material, so whether a signature is
-trusted is the ruleset's call as well.
+ancestor of `origin/main`, both before anything builds. That is defense in
+depth. What actually stops a bad tag is the `release-tags` ruleset, which holds
+`refs/tags/v*` to signed tags and restricts creation, update, deletion and
+non-fast-forward. So the tag has to be signed, not merely annotated, and that
+needs `user.signingkey` set locally with the key registered on the GitHub
+account as a signing key. SSH counts: `gpg.format ssh` with the public key path
+as the signing key. A repo admin can bypass the ruleset, which is worth knowing
+about and not worth using.
 
 Dry run before the tag. `gh workflow run release.yml --ref <branch>` builds all
 three platforms and runs the release tests off a branch, and publishing is gated
@@ -141,9 +145,10 @@ that idempotent.
 
 Rollback is delete, never move. `gh release delete vX.Y.Z --cleanup-tag` takes
 the release and the tag down together, and the next push of that tag is a clean
-run. Repointing a live tag at a new commit is the thing to avoid: anyone who
-already pulled it keeps the old binaries under the same version number. Cut
-X.Y.Z+1 instead.
+run. The same ruleset restricts tag deletion, so that step needs the account
+that can bypass it. Repointing a live tag at a new commit is the thing to avoid:
+anyone who already pulled it keeps the old binaries under the same version
+number. Cut X.Y.Z+1 instead.
 
 Then the downstream one. `cwtools-vscode` bundles this engine as the
 `submodules/cwtools` submodule, and its release refuses an untagged engine
