@@ -11,6 +11,23 @@ fn path_uri(path: impl AsRef<std::path::Path>) -> String {
         .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
+/// A canonical URI rewritten the way VS Code spells it: on Windows the drive
+/// letter is lower-cased and its colon percent-encoded (`file:///d%3A/…`), which
+/// is not what `Url::from_file_path` writes (#319). A no-op elsewhere, where the
+/// two already agree.
+fn client_spelling(uri: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = uri.strip_prefix("file:///")
+            && let Some((drive, tail)) = rest.split_once(':')
+            && drive.len() == 1
+        {
+            return format!("file:///{}%3A{tail}", drive.to_ascii_lowercase());
+        }
+    }
+    uri.to_string()
+}
+
 /// Scratch home for every server this binary spawns. It has to outlive the
 /// children, so it is a static: leaking the dir at process exit is the point,
 /// the OS temp cleaner takes it from there.
@@ -287,6 +304,9 @@ fn test_lsp_unknown_notification_does_not_crash() {
 ///
 /// Encoding a plain letter (`dup.txt` → `%64up.txt`) exercises the same fold on
 /// every platform; the drive-letter half is covered by the `paths` unit tests.
+/// The workspace folder is sent in the client's spelling too, because
+/// `workspace_prefix` is derived from it and every logical path is stripped
+/// against it.
 #[test]
 fn test_did_open_folds_a_percent_encoded_uri_onto_the_canonical_one() {
     let ws = tempfile::tempdir().unwrap();
@@ -301,8 +321,9 @@ fn test_did_open_folds_a_percent_encoded_uri_onto_the_canonical_one() {
 
     let canonical_uri = path_uri(&file_path);
     // The client's spelling: same file, `d` written as `%64`.
-    let client_uri = canonical_uri.replace("dup.txt", "%64up.txt");
+    let client_uri = client_spelling(&canonical_uri).replace("dup.txt", "%64up.txt");
     assert_ne!(client_uri, canonical_uri, "the spellings must differ");
+    let client_root = client_spelling(&path_uri(ws.path()));
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -317,7 +338,7 @@ fn test_did_open_folds_a_percent_encoded_uri_onto_the_canonical_one() {
         "initialize",
         serde_json::json!({
             "processId": std::process::id(),
-            "rootUri": path_uri(ws.path()),
+            "rootUri": client_root,
             "capabilities": {},
             "initializationOptions": {
                 "language": "hoi4",
