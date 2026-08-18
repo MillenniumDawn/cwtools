@@ -1,3 +1,64 @@
+# 2.6.0
+
+## Features
+
+- CLI `validate`/`loc`/`rules`: `--fail-on <severity>` picks the severity that fails the run, and `--quiet`/`--no-color` trim output; `explain CWxxx` and `list-codes` print the embedded diagnostic catalog. (#109, #281)
+- CLI `validate`: scope the report with `--file` and `--since`. (#254)
+- CLI `loc`: wires the ruleset and scope registry in, and validates command tails (#268) and multi-segment command chains against a variable registry. (#260, #261)
+- LSP: rule-aware scope inlay hints. (#99, #275)
+- LSP: localisation document outline, references, and sibling-aware rename. (#270)
+- LSP: incremental semantic tokens with delta and hash memoization, gated by capability. (#184, #251, #252)
+- LSP: inline `# cwtools-ignore CWxxx` suppression, plus an ignore-in-workspace action. (#105, #282)
+- LSP: validate `inline_script` bodies at the call site. (#259)
+- LSP: apply settings without restart. (#227)
+- LSP: report progress and honour cancellation for long commands. (#224)
+- Diagnostics: rules-config problems become reportable codes CW600-CW603 instead of stderr text. (#130, #247)
+- Diagnostics: doc links, deprecation/redundant tags, and related spans. (#246)
+- Quick fixes: did-you-mean for a misspelled `enum[..]` value (CW240) and unquote for a known inline loc key (CW122). (#226)
+
+## Bug Fixes
+
+- LSP: populate the file index so CW113 fires in the editor. (#311)
+- LSP: fix flaky `reloadrulesconfig` scan-started waits; `reindexWorkspace` retries on a scan-guard race. (#222, #220, #223)
+- LSP: a superseded edit's abort is no longer logged as a panic. (#182, #239)
+- CW226 handles parenthesized Jomini expressions. (#303)
+- Localisation discovery honours ignore globs. (#294)
+- `file_manager` matches ignore globs against paths, not just names. (#280)
+- Windows drive parsing reads only a leading drive letter. (#307)
+- Rules: unquote rule-level `##` directive values. (#309)
+- `FilepathField` probes are contained inside the search roots. (#233)
+- Corrected the post-merge doc-anchor failure and the `CWTOOLS_PROFILE` doc claim. (#248)
+
+## Improvements
+
+- Reuse parsed vanilla files and keep the parse cache across rules-config edits when rebuilding the cache. (#305, #304)
+- `rules` loads the `.cwt` directory in parallel. (#297)
+- LSP info-revision bump gated on the export fingerprint. (#310)
+- `index` writes `.cwv` with a checksum, atomically, with recovery. (#276)
+- CLI names the checks a missing base-game index disables. (#257)
+- Memoize equivalent alias-validation subtrees. (#238)
+- Validation: drop the field-matcher catch-alls and close CW100/CW235/CW261 refinement gaps. (#300, #262)
+- Rules read shared type options from `##` comment directives. (#269)
+- Validation now covers did_save, closed-file CW239, real BOM bytes, `.cwv` corruption, and the Steam-folder map. (#146, #243)
+- Concurrent command progress streams are kept separate. (#228, #241)
+
+## Notes
+
+- Release tags must be annotated (`git tag -s -a vX.Y.Z`) and point into protected `main`; a bare or off-main tag is refused. (#158, #230, #240)
+- Release build jobs no longer hold repository-write credentials. (#168, #229)
+
+## Developer
+
+- CI runs both diagnostics guard tiers and adds a `cargo-llvm-cov` coverage baseline job. (#312, #250)
+- `parse_string` returns a `ParsedFile` directly (breaking API change for library consumers). (#150, #237)
+- Re-bless the corpus baseline for CW266/CW267/CW226/CW240. (#272)
+- Add the `validate_hot` bench and TRACE spans for the batch inner loop. (#296)
+- Centralize workspace lints, repository, and test deps. (#225)
+- Split the oversized LSP and info sources. (#65, #253)
+- Harden Windows/macOS portability and raise coverage. (#267)
+- Polish a Rust idioms batch; correct drifted docs and comments; align the README. (#249, #242, #235, #234, #295, #308)
+- Dependency bumps. (#301, #302)
+
 # 2.5.0
 
 ## Features
