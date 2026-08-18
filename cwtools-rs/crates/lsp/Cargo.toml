@@ -20,6 +20,7 @@ cwtools_file_manager = { workspace = true }
 cwtools_rules = { workspace = true }
 cwtools_validation = { workspace = true }
 cwtools_error_codes = { workspace = true }
+cwtools_i18n = { workspace = true }
 cwtools_info = { workspace = true }
 cwtools_driver = { workspace = true }
 cwtools_game = { workspace = true }

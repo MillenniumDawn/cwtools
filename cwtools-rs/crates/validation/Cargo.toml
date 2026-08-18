@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 cwtools_error_codes = { workspace = true }
+cwtools_i18n = { workspace = true }
 cwtools_parser = { workspace = true }
 cwtools_rules = { workspace = true }
 cwtools_string_table = { workspace = true }

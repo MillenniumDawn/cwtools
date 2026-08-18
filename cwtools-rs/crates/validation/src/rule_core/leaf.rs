@@ -475,7 +475,7 @@ pub(super) fn validate_leaf(
                 let replacement =
                     format!("\"{}\"", cand.replace('\\', "\\\\").replace('"', "\\\""));
                 err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
-                    format!("Did you mean '{}'?", cand),
+                    cwtools_i18n::format(cwtools_i18n::Key::ActionDidYouMean, &[cand]),
                     leaf.value_pos,
                     replacement,
                 ));

@@ -1,101 +1,16 @@
 //! The CW diagnostic catalog, as the CLI sees it.
 //!
-//! `cwtools_error_codes` exposes one `pub const` per code but no list of them,
-//! so the list is mirrored here: `--ignore-code` / `--only-code` validate
-//! against it (a typo is an error, not a silent no-op). Not every mirrored code
-//! is currently emitted; pending codes are marked in `PENDING_CODES`. The SARIF
-//! report only turns emitted codes into `tool.driver.rules`.
+//! The code list itself is `cwtools_error_codes::CATALOG`; `--ignore-code` /
+//! `--only-code` validate against it (a typo is an error, not a silent no-op).
+//! Not every listed code is currently emitted; pending codes are marked in
+//! `PENDING_CODES`. The SARIF report only turns emitted codes into
+//! `tool.driver.rules`.
 //!
 //! The long form of what a code means lives in `docs/ERROR_CODES.md` and is
 //! read from there rather than copied: [`doc_row`] parses the row `explain`
 //! prints, so the reference stays the one place the prose is written.
 
-use cwtools_error_codes::ErrorCode;
-
-macro_rules! catalog {
-    ($($name:ident),+ $(,)?) => {
-        /// Known diagnostic codes, including wired and pending checks.
-        const CATALOG: &[(&str, ErrorCode)] = &[
-            $((stringify!($name), cwtools_error_codes::$name),)+
-        ];
-    };
-}
-
-catalog![
-    CW001_PARSE_ERROR,
-    CW100_MISSING_LOCALISATION,
-    CW104_INCORRECT_TRIGGER_SCOPE,
-    CW105_INCORRECT_EFFECT_SCOPE,
-    CW106_INCORRECT_SCOPE_SCOPE,
-    CW107_EVENT_EVERY_TICK,
-    CW108_RESEARCH_LEADER_AREA,
-    CW109_RESEARCH_LEADER_TECH,
-    CW110_TECH_CAT_MISSING,
-    CW113_MISSING_FILE,
-    CW120_POSSIBLE_PRETRIGGER,
-    CW121_EMPTY_IF,
-    CW122_LOC_KEY_IN_INLINE,
-    CW220_UNSAVED_EVENT_TARGET,
-    CW221_MAYBE_UNSAVED_EVENT_TARGET,
-    CW222_UNDEFINED_EVENT,
-    CW223_INCORRECT_NOT_USAGE,
-    CW225_UNDEFINED_LOC_REFERENCE,
-    CW226_INVALID_LOC_COMMAND,
-    CW227_UNKNOWN_SECTION_TEMPLATE,
-    CW228_MISSING_SECTION_SLOT,
-    CW229_UNKNOWN_COMPONENT_TEMPLATE,
-    CW230_MISMATCHED_COMPONENT_AND_SLOT,
-    CW231_UNUSED_TECH,
-    CW233_UNDEFINED_ENTITY,
-    CW234_REPLACE_ME_LOC,
-    CW235_ZERO_MODIFIER,
-    CW236_DEPRECATED_ELSE,
-    CW237_AMBIGUOUS_IF_ELSE,
-    CW238_IF_ELSE_ORDER,
-    CW239_UNUSED_TYPE,
-    CW240_UNEXPECTED_VALUE,
-    CW242_WRONG_NUMBER,
-    CW243_TARGET_WRONG_SCOPE,
-    CW244_INVALID_TARGET,
-    CW245_ERROR_IN_TARGET,
-    CW246_UNSET_VARIABLE,
-    CW247_RULE_WRONG_SCOPE,
-    CW248_INVALID_SCOPE_COMMAND,
-    CW250_PLANET_KILLER_MISSING,
-    CW251_UNNECESSARY_BOOLEAN,
-    CW253_DEPRECATED_SET_NAME,
-    CW254_WRONG_ENCODING,
-    CW255_MISSING_LOC_FILE_LANG,
-    CW256_MISSING_LOC_FILE_LANG_HEADER,
-    CW257_LOC_FILE_LANG_MISMATCH,
-    CW259_RECURSIVE_LOC_REF,
-    CW260_LOC_COMMAND_WRONG_SCOPE,
-    CW261_DUPLICATE_TYPE_DEF,
-    CW262_UNEXPECTED_PROPERTY_NODE,
-    CW263_UNEXPECTED_PROPERTY_LEAF,
-    CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
-    CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
-    CW266_LOC_COMMAND_NOT_IN_DATA_TYPE,
-    CW267_UNEXPECTED_ALIAS_KEY_VALUE,
-    CW268_LOC_MISSING_QUOTE,
-    CW269_OPTIMISATION_MERGE_LIST,
-    CW270_VARIABLE_TOO_SMALL,
-    CW271_VARIABLE_INT_ONLY,
-    CW272_FROM_RULES_CUSTOM_ERROR,
-    CW273_UNDEFINED_MODIFIER_TYPE,
-    CW274_INLINE_SCRIPT_ERROR,
-    CW275_LOC_INVALID_CHARS,
-    CW276_LOC_KEY_INVALID_CHARS,
-    CW277_ALIAS_BRANCH_LIMIT,
-    CW280_REDUNDANT_DEFAULT_FIELD,
-    CW281_EMPTY_LIMIT,
-    CW282_REDUNDANT_DEFAULT_BOOL,
-    CW500_TYPE_NOT_FOUND,
-    CW600_RULES_FILE_UNREADABLE,
-    CW601_RULES_UNDEFINED_REFERENCE,
-    CW602_RULES_UNEXPANDED_ALIAS,
-    CW603_RULES_INVALID_DIRECTIVE,
-];
+use cwtools_error_codes::{CATALOG, ErrorCode};
 
 // Codes defined in `error_codes` but not yet wired. Kept in step with the
 // reference's Status column by `pending_codes_match_the_reference_status`: a
@@ -247,35 +162,6 @@ pub(crate) fn rule_summary(const_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The enumeration above is hand-mirrored, so a code added to
-    /// `cwtools_error_codes` without a line here could be invisible to
-    /// `--ignore-code`. Diff the two lists straight from the source rather than
-    /// trusting the mirror.
-    #[test]
-    fn catalog_covers_supported_error_code_consts() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../error_codes/src/lib.rs"),
-        )
-        .expect("error_codes source is a sibling crate in the same workspace");
-        const RETIRED_CODES: &[&str] = &["CW258_LOC_FILE_LANG_WRONG_PLACE"];
-
-        let mut declared: Vec<&str> = src
-            .lines()
-            .filter_map(|l| {
-                let (name, ty) = l.strip_prefix("pub const ")?.split_once(':')?;
-                ty.trim_start().starts_with("ErrorCode").then_some(name)
-            })
-            .filter(|name| !RETIRED_CODES.contains(name))
-            .collect();
-        declared.sort_unstable();
-        let mut mirrored: Vec<&str> = CATALOG.iter().map(|(name, _)| *name).collect();
-        mirrored.sort_unstable();
-        assert_eq!(
-            declared, mirrored,
-            "crates/cli/src/codes.rs must list all supported ErrorCode consts in crates/error_codes"
-        );
-    }
 
     /// Every diagnostic links to `docs/ERROR_CODES.md#cw###`, so a code with no
     /// anchor there lands the reader at the top of the file instead of on its

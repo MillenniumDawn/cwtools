@@ -112,14 +112,14 @@ impl Phase {
     /// The user-facing phase text. Also the `loadingBar` status-bar string, so
     /// the two channels can't drift.
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            Phase::Discover => "Scanning workspace…",
-            Phase::Parse => "Indexing workspace…",
-            Phase::Vanilla => "Indexing base game…",
-            Phase::Localisation => "Building localisation index…",
-            Phase::Validate => "Validating workspace…",
-            Phase::Publish => "Publishing diagnostics…",
-        }
+        cwtools_i18n::t(match self {
+            Phase::Discover => cwtools_i18n::Key::ProgressDiscover,
+            Phase::Parse => cwtools_i18n::Key::ProgressParse,
+            Phase::Vanilla => cwtools_i18n::Key::ProgressVanilla,
+            Phase::Localisation => cwtools_i18n::Key::ProgressLocalisation,
+            Phase::Validate => cwtools_i18n::Key::ProgressValidate,
+            Phase::Publish => cwtools_i18n::Key::ProgressPublish,
+        })
     }
 }
 
@@ -387,7 +387,9 @@ impl Drop for CommandProgress {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 sink.send(WorkDoneProgress::End(WorkDoneProgressEnd {
-                    message: Some("Cancelled.".to_string()),
+                    message: Some(
+                        cwtools_i18n::t(cwtools_i18n::Key::ProgressCancelled).to_string(),
+                    ),
                 }))
                 .await;
             });

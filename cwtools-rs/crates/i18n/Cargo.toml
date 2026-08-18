@@ -1,5 +1,5 @@
 [package]
-name = "cwtools_error_codes"
+name = "cwtools_i18n"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +10,3 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-cwtools_i18n.workspace = true

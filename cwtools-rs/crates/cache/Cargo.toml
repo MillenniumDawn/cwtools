@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
+cwtools_i18n = { workspace = true }
 rkyv = { workspace = true }
 zstd = { workspace = true }
 thiserror = { workspace = true }

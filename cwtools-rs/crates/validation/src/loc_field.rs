@@ -168,7 +168,7 @@ fn check_loc_key(
                 .with_end(leaf.pos.end);
                 if cwtools_parser::parser::is_bare_string_value(key_raw) {
                     err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
-                        "Remove unnecessary quotes",
+                        cwtools_i18n::t(cwtools_i18n::Key::ActionRemoveUnnecessaryQuotes),
                         leaf.value_pos,
                         key_raw,
                     ));

@@ -98,7 +98,7 @@ pub(super) fn ignore_code_actions(
         let mut changes = std::collections::HashMap::new();
         changes.insert(settings_uri.clone(), vec![whole_file]);
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Ignore {code} in this workspace"),
+            title: cwtools_i18n::format(cwtools_i18n::Key::ActionIgnoreCode, &[code]),
             kind: Some(CodeActionKind::QUICKFIX),
             diagnostics: Some(related),
             edit: Some(WorkspaceEdit {

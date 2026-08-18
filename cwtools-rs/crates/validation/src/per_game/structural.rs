@@ -218,9 +218,7 @@ fn validate_event_every_tick(
             push(
                 errors,
                 &error_codes::CW107_EVENT_EVERY_TICK,
-                error_codes::CW107_EVENT_EVERY_TICK
-                    .message_template
-                    .to_string(),
+                error_codes::CW107_EVENT_EVERY_TICK.message().to_string(),
                 key_token_range(block.range.start, key_len),
                 file_path,
             );
@@ -341,7 +339,7 @@ fn walk(
 
         // CW121 — empty if/else_if. Fix: delete the empty block.
         if (key == kw.if_ || key == kw.else_if) && is_empty_if(block.children, ast, kw) {
-            let msg = error_codes::CW121_EMPTY_IF.message_template.to_string();
+            let msg = error_codes::CW121_EMPTY_IF.message().to_string();
             if chain_follows(children, idx, ast, kw) {
                 push(
                     errors,
@@ -357,7 +355,10 @@ fn walk(
                     msg,
                     block.range,
                     file_path,
-                    SuggestedFix::delete("Remove empty if", block.range),
+                    SuggestedFix::delete(
+                        cwtools_i18n::t(cwtools_i18n::Key::ActionRemoveEmptyIf),
+                        block.range,
+                    ),
                 );
             }
         }
@@ -367,10 +368,13 @@ fn walk(
             push_fix(
                 errors,
                 &error_codes::CW281_EMPTY_LIMIT,
-                error_codes::CW281_EMPTY_LIMIT.message_template.to_string(),
+                error_codes::CW281_EMPTY_LIMIT.message().to_string(),
                 block.range,
                 file_path,
-                SuggestedFix::delete("Remove empty limit", block.range),
+                SuggestedFix::delete(
+                    cwtools_i18n::t(cwtools_i18n::Key::ActionRemoveEmptyLimit),
+                    block.range,
+                ),
             );
         }
 
@@ -431,8 +435,8 @@ pub fn validate_structural(
 ) {
     // HOI4 has no NOR/NAND triggers, so the default CW223 advice is invalid there.
     let cw223_msg = match game {
-        Game::Hoi4 => error_codes::CW223_INCORRECT_NOT_USAGE_HOI4_MSG,
-        _ => error_codes::CW223_INCORRECT_NOT_USAGE.message_template,
+        Game::Hoi4 => error_codes::cw223_hoi4_message(),
+        _ => error_codes::CW223_INCORRECT_NOT_USAGE.message(),
     };
     let kw = Keywords::new(table);
     walk(
