@@ -25,10 +25,12 @@ pub struct LocIndex {
     union: LocKeySet,
     /// languages the project actually ships loc data for
     languages_with_data: Vec<Lang>,
-    /// lowercased key -> a representative parsed entry (English preferred), kept
-    /// ONLY for keys whose representative actually has `[command]` chains — the
-    /// sole consumer is the scope-aware command check. Keeping a full entry per
-    /// key would re-clone all ~2M loc entries; almost none carry commands.
+    /// lowercased key -> a representative parsed entry for command validation.
+    /// English wins when it exists: an English string with no `[command]`s stores
+    /// nothing, so a later Brazilian `[Grécia]` cannot become the representative.
+    /// Without English, the first command-bearing entry wins. Kept only for keys
+    /// whose representative has `[command]` chains; the sole consumer is the
+    /// scope-aware command check.
     entries: FxHashMap<LocKey, LocEntry>,
 }
 
@@ -55,13 +57,21 @@ impl LocIndex {
             for entry in &file.entries {
                 let lower = Self::intern_key(&mut union, entry.key.to_lowercase());
                 set.insert(Arc::clone(&lower));
-
-                // Representative entry for command validation only — skip keys
-                // with no commands so the map stays tiny.
+            }
+        }
+        let english = per_language.get(&Lang::English);
+        for file in service.files() {
+            let Some(lang) = file.lang else { continue };
+            for entry in &file.entries {
                 if entry.commands.is_empty() && entry.jomini_commands.is_empty() {
                     continue;
                 }
-                // Prefer the English entry; otherwise keep the first seen.
+                let Some(lower) = union.get(entry.key.to_lowercase().as_str()).cloned() else {
+                    continue;
+                };
+                if lang != Lang::English && english.is_some_and(|s| s.contains(&lower)) {
+                    continue;
+                }
                 match entries.get(&lower) {
                     Some(_) if lang != Lang::English => {}
                     _ => {
@@ -127,6 +137,18 @@ impl LocIndex {
     /// its languages are walked in `languages_with_data` order, which is the
     /// complete set only when nothing was scoped out.
     pub fn merge_from(&mut self, other: &LocIndex, langs: Option<&[Lang]>) {
+        for (key, entry) in &other.entries {
+            if self
+                .per_language
+                .get(&Lang::English)
+                .is_some_and(|s| s.contains(key))
+            {
+                continue;
+            }
+            self.entries
+                .entry(Arc::clone(key))
+                .or_insert_with(|| entry.clone());
+        }
         for lang in &other.languages_with_data {
             let Some(keys) = other.per_language.get(lang) else {
                 continue;
@@ -146,11 +168,6 @@ impl LocIndex {
             if allowed && !self.languages_with_data.contains(lang) {
                 self.languages_with_data.push(*lang);
             }
-        }
-        for (key, entry) in &other.entries {
-            self.entries
-                .entry(Arc::clone(key))
-                .or_insert_with(|| entry.clone());
         }
     }
 
@@ -358,5 +375,80 @@ mod tests {
         assert_eq!(idx.languages_with_data(), &[Lang::English]);
         // Existence still resolves against every loaded language.
         assert!(idx.exists_any("key_a"));
+    }
+
+    #[test]
+    fn english_without_commands_blocks_other_languages() {
+        let braz = ("b_l_braz_por.yml", "l_braz_por:\n shared: \"[Grecia]\"\n");
+        let eng = ("a_l_english.yml", "l_english:\n shared: \"plain\"\n");
+        for files in [[braz, eng], [eng, braz]] {
+            let idx = LocIndex::build(&service_from(&files));
+            assert!(idx.exists_any("shared"));
+            assert!(
+                idx.entry("shared").is_none(),
+                "English without commands must not keep another language's, order={files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn english_with_commands_wins_over_other_languages() {
+        let braz = ("b_l_braz_por.yml", "l_braz_por:\n shared: \"[Grecia]\"\n");
+        let eng = (
+            "a_l_english.yml",
+            "l_english:\n shared: \"[ROOT.GetName]\"\n",
+        );
+        for files in [[braz, eng], [eng, braz]] {
+            let desc = &idx_entry(&service_from(&files)).desc;
+            assert!(
+                desc.contains("ROOT.GetName"),
+                "expected English commands, got {desc:?}, order={files:?}"
+            );
+        }
+    }
+
+    fn idx_entry(svc: &LocService) -> LocEntry {
+        LocIndex::build(svc)
+            .entry("shared")
+            .cloned()
+            .expect("command-bearing representative")
+    }
+
+    #[test]
+    fn no_english_keeps_first_command_bearing() {
+        let braz = ("b_l_braz_por.yml", "l_braz_por:\n shared: \"[Grecia]\"\n");
+        let pol = (
+            "c_l_polish.yml",
+            "l_polish:\n shared: \"[GRE.GetNameWithFlag]\"\n",
+        );
+        assert!(
+            idx_entry(&service_from(&[braz, pol]))
+                .desc
+                .contains("Grecia")
+        );
+        assert!(
+            idx_entry(&service_from(&[pol, braz]))
+                .desc
+                .contains("GetNameWithFlag")
+        );
+    }
+
+    #[test]
+    fn merge_from_does_not_adopt_vanilla_commands_when_workspace_has_english() {
+        let workspace = LocIndex::build(&service_from(&[(
+            "ws_l_english.yml",
+            "l_english:\n shared: \"plain\"\n",
+        )]));
+        let vanilla = LocIndex::build(&service_from(&[(
+            "v_l_german.yml",
+            "l_german:\n shared: \"[GetName]\"\n",
+        )]));
+        let mut merged = workspace;
+        merged.merge_from(&vanilla, None);
+        assert!(merged.exists_any("shared"));
+        assert!(
+            merged.entry("shared").is_none(),
+            "workspace English without commands must not pick up vanilla's"
+        );
     }
 }

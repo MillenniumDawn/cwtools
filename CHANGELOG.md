@@ -6,10 +6,12 @@
 
 ## Bug Fixes
 
+- `cwtools validate` no longer changes its diagnostics when the same mod sits on a different filesystem. Loc discovery and `.cwt` loading sort each directory, and a loc key's command-validation representative is the English entry when English exists, even if that string has no `[command]`s. A Brazilian `[Grécia]` (or any other language's commands) can no longer turn a valid `desc = EUevent.5.d` into CW267. (#313)
 - LSP: a document the editor spells differently from the workspace scan is no longer indexed twice. On Windows that was every open file — VS Code writes the drive as a lower-case letter with a percent-encoded colon (`file:///d%3A/…`) where the scan writes `file:///D:/…` — so CW261 reported every instance of a `## unique` type in an opened file as defined twice, squiggling focus trees and scripted-effect files end to end. Both the encoding and the drive-letter case now fold onto one spelling, for the workspace folder as well as the documents inside it. (#319)
 
 ## Notes
 
+- **Behavioral:** a loc-typed field is judged against the English string when English exists. The MD guard baseline drops two CW267 rows on `events/EU_events.txt` (`EUevent.5.d` / `EUevent.7.d`) and one CW266 on `events/Iran.txt` (`axis_of_resistance_events.2.t`), all of which were other languages' `[command]`s winning the representative.
 - **Behavioral:** the parse cache fingerprint (`CACHE_VERSION`) moves to 8 and now includes the display locale. The `.cwe` sidecar stores each file's diagnostics as finished text, so a cache written in one language would otherwise be replayed verbatim in another. Existing caches are a clean miss on first run after upgrading, and changing the editor's display language costs one cold re-index.
 
 ## Developer

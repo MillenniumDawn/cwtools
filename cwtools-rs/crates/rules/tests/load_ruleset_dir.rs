@@ -163,6 +163,31 @@ fn load_ruleset_dir_codes_and_grades_every_problem() {
     assert_eq!(find("CW603").severity, ErrorSeverity::Warning);
 }
 
+#[test]
+fn load_ruleset_dir_merges_cwt_files_in_sorted_order() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("zebra.cwt"),
+        "types = { type[zebra_only] = { path = \"common/zebra\" } }\n",
+    )
+    .expect("write zebra.cwt");
+    std::fs::write(
+        tmp.path().join("alpha.cwt"),
+        "types = { type[alpha_only] = { path = \"common/alpha\" } }\n",
+    )
+    .expect("write alpha.cwt");
+
+    let table = StringTable::new();
+    let (ruleset, errors) = load_ruleset_from_dir(
+        tmp.path(),
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
+    assert!(errors.is_empty(), "errors: {errors:?}");
+    let names: Vec<&str> = ruleset.types.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha_only", "zebra_only"], "got {names:?}");
+}
+
 /// End-to-end load of the real HOI4 config (`cwtools-hoi4-config`), which is
 /// its own repo and not vendored here.
 ///

@@ -5284,8 +5284,6 @@ events/DPR.txt,270,Information,CW272,This is a deprecated command. Use add_count
 events/Denmark.txt,385,Information,CW272,"This is an deprecated command. Uadd_field_marshal_role instead when possible. The created field marshal will not be able to have a portrait if assigned to be a minister via officer corps, causing errors."
 events/Denmark.txt,395,Information,CW272,"This is an deprecated command. use add_corps_commander_role instead when possible. The created corps commander will not be able to have a portrait if assigned to be a minister via officer corps, causing errors."
 events/Denmark.txt,425,Information,CW272,This is a deprecated command. Use add_country_leader_role instead when possible.
-events/EU_events.txt,167,Error,CW267,"Expected a desc value, got EUevent.5.d"
-events/EU_events.txt,215,Error,CW267,"Expected a desc value, got EUevent.7.d"
 events/EU_news.txt,526,Error,CW267,"Expected a desc value, got EU_news.52.d"
 events/Econ_events.txt,1880,Error,CW226,"Localisation key ""bankruptcy.1.d"" uses command ""debt_bailout_display"" which doesn't exist"
 events/Econ_events.txt,2052,Error,CW226,"Localisation key ""bankruptcy.2.d"" uses command ""debt_bailout_display"" which doesn't exist"
@@ -5460,7 +5458,6 @@ events/Iran.txt,15675,Warning,CW100,Localisation key equipment_conversion_speed_
 events/Iran.txt,16009,Information,CW272,This is a deprecated command. Use add_country_leader_role instead when possible.
 events/Iran.txt,16035,Information,CW272,This is a deprecated command. Use add_country_leader_role instead when possible.
 events/Iran.txt,16079,Warning,CW100,Localisation key cic_construction_boost_factor_tt is not defined for any language
-events/Iran.txt,1671,Error,CW266,Localisation key axis_of_resistance_events.2.t uses command aor_invited_country which does not exist in data type scope.
 events/Iran.txt,1672,Error,CW266,Localisation key axis_of_resistance_events.2.d uses command aor_invited_country which does not exist in data type scope.
 events/Iran.txt,1684,Error,CW266,Localisation key axis_of_resistance_events.3.t uses command aor_invited_country which does not exist in data type scope.
 events/Iran.txt,1685,Error,CW266,Localisation key axis_of_resistance_events.3.d uses command aor_invited_country which does not exist in data type scope.
