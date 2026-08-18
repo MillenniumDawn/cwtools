@@ -85,7 +85,16 @@ nested math block unless noted otherwise.
 | `every_collection` | iterates a named collection (see below) |
 
 `else_if` is not in the vanilla list above but appears in real mod code as the
-expected middle branch between `if` and `else`; the validator accepts it.
+expected middle branch between `if` and `else`; the HOI4 config declares it, so
+the validator accepts it. Same for five more the config carries that the list
+above doesn't:
+
+| Operator | Effect on the accumulator |
+|---|---|
+| `and` / `or` | returns 1 if both / either of the accumulator and the argument are non-zero, else 0 (short-circuiting) |
+| `atan` | arctangent of the accumulator, in radians (argument `yes`) |
+| `atan2` | quadrant-aware `atan2(accumulator, argument)` |
+| `lerp = { to = a  alpha = b }` | interpolates from the accumulator toward `to` by `alpha` |
 
 `log`, `root`, `pow` (fractional exponents), `sin`, `cos`, and `tan` are numerical
 approximations and can produce small rounding errors (e.g. `3.00001`). Follow with
@@ -126,7 +135,10 @@ total = {
 ## What the validator checks
 
 Inside a math block the only valid keys are `value`, `tooltip`, and the operators
-above. Anything else is flagged:
+above. The operator set is not baked into the validator: it is whatever the
+ruleset declares as `alias[mathexpr:...]`, and the argument shapes come from the
+same definitions, so `else_if` and anything else the config adds is accepted
+because the config says so. Anything else is flagged:
 
 - `CW263`: unexpected leaf field (e.g. a mis-typed `subtrac = x`).
 - `CW262`: unexpected block.
