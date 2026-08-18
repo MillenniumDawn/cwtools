@@ -641,6 +641,10 @@ impl Backend {
     /// `parsed_version` is the document version `parsed` came from, when it came
     /// from an open document. Callers indexing from disk (the workspace scan,
     /// the did_close restore) pass `None`.
+    ///
+    /// The info revision is bumped only when the file's export fingerprint
+    /// moved, the same condition `debounced_validate` gates the dependent sweep
+    /// on. See the comment at the bump for why that covers every consumer.
     #[tracing::instrument(skip_all, fields(uri = %uri))]
     pub(crate) fn index_parsed_file(
         &self,
@@ -681,6 +685,7 @@ impl Backend {
             return;
         }
         let mut info = self.state.info_service.write();
+        let exports_before = info.export_fingerprint(uri);
         info.clear_file(uri);
         if let (Some(ruleset), Some(collected)) = (ruleset.as_ref(), collected) {
             info.index_file_with_precomputed_instances(
@@ -693,8 +698,18 @@ impl Backend {
                 collected.subtype_instances,
             );
         }
+        let exports_changed = info.export_fingerprint(uri) != exports_before;
         drop(info);
-        self.bump_info_revision();
+        // Both caches keyed on the info revision are built from exactly the
+        // symbols this fingerprint covers: `fallback_cache` from
+        // `variable_counts` + `event_target_counts`, `loc_ref_names_cache` from
+        // the type index's instance names + `var_index` (plus the ruleset's
+        // modifier keys, which this path never touches). An edit inside a rule
+        // body leaves all of them identical, so bumping unconditionally threw
+        // both away on every keystroke and paid a full rebuild for nothing.
+        if exports_changed {
+            self.bump_info_revision();
+        }
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
@@ -2026,6 +2041,267 @@ mod perf_bench {
                 .len()
             });
         }
+    }
+}
+
+/// `index_parsed_file` bumps `info_revision` only when the reindexed file's
+/// export fingerprint moved (#289). These pin both halves: an edit that changes
+/// no export must leave the derived caches valid, and any edit that adds,
+/// renames or removes one must invalidate them.
+#[cfg(test)]
+mod info_revision_tests {
+    use super::*;
+    use crate::{Backend, CompletionCacheEntry, DocumentState};
+    use cwtools_rules::rules_types::{PathOptions, TypeDefinition};
+    use std::sync::atomic::Ordering;
+
+    /// Workspace URI for the fixtures. Drive-lettered on Windows so the derived
+    /// path is absolute there too (see the `abs()` helpers elsewhere).
+    const WORKSPACE_URI: &str = if cfg!(windows) {
+        "file:///C:/ws"
+    } else {
+        "file:///ws"
+    };
+
+    /// A file under the one path the fixture ruleset indexes.
+    fn ideas_uri() -> String {
+        format!("{WORKSPACE_URI}/common/ideas/00_ideas.txt")
+    }
+
+    /// A `Backend` over a real (never-initialized) `Client`, carrying a
+    /// one-type ruleset and the workspace prefix the logical path is derived
+    /// from. Same construction as `scan`'s `test_backend`.
+    fn test_backend() -> Backend {
+        let state = Arc::new(DocumentState::new());
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let slot = captured.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = tower_lsp::LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let client = captured.lock().take().unwrap();
+        state.config.write().workspace_prefix =
+            Some(crate::paths::workspace_prefix_of(WORKSPACE_URI));
+        let mut ruleset = RuleSet::new();
+        ruleset.types.push(TypeDefinition {
+            name: "idea".to_string(),
+            name_field: None,
+            path_options: PathOptions {
+                paths: vec!["common/ideas".to_string()],
+                ..Default::default()
+            },
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        ruleset.reindex();
+        state.rules.write().ruleset = Some(Arc::new(ruleset));
+        Backend { client, state }
+    }
+
+    fn index(backend: &Backend, uri: &str, text: &str) {
+        let parsed = parse_string(text, &backend.state.string_table);
+        backend.index_parsed_file(uri, &parsed, None);
+    }
+
+    fn revision(backend: &Backend) -> u64 {
+        backend.state.info_revision.load(Ordering::Relaxed)
+    }
+
+    /// Seed `fallback_cache` the way the completion handler does, so the tests
+    /// assert against the real hit condition (`request.rs`: revision match plus
+    /// a non-empty list) rather than a paraphrase of it.
+    fn seed_fallback_cache(backend: &Backend) {
+        *backend.state.fallback_cache.lock() = Some(CompletionCacheEntry {
+            revision: revision(backend),
+            items: vec![CompletionItem {
+                label: "seeded".to_string(),
+                ..Default::default()
+            }],
+        });
+    }
+
+    fn fallback_cache_hits(backend: &Backend) -> bool {
+        let current = revision(backend);
+        backend
+            .state
+            .fallback_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|entry| entry.revision == current && !entry.items.is_empty())
+    }
+
+    #[tokio::test]
+    async fn first_index_of_a_new_file_bumps_the_revision() {
+        let backend = test_backend();
+        let before = revision(&backend);
+        index(&backend, &ideas_uri(), "my_idea = {\n\tcost = 5\n}\n");
+        assert_ne!(
+            revision(&backend),
+            before,
+            "a file's first index publishes exports nothing had seen"
+        );
+        assert!(backend.loc_ref_names().contains("my_idea"));
+    }
+
+    #[tokio::test]
+    async fn editing_a_rule_body_leaves_the_derived_caches_valid() {
+        let backend = test_backend();
+        let uri = ideas_uri();
+        index(&backend, &uri, "my_idea = {\n\tcost = 5\n}\n");
+        let settled = revision(&backend);
+        let names_before = backend.loc_ref_names();
+        seed_fallback_cache(&backend);
+
+        // Same definition, different body, the shape of nearly every keystroke.
+        index(&backend, &uri, "my_idea = {\n\tcost = 7\n}\n");
+
+        assert_eq!(
+            revision(&backend),
+            settled,
+            "an edit inside a rule body exports the same symbols"
+        );
+        let names_after = backend.loc_ref_names();
+        assert!(
+            Arc::ptr_eq(&names_before, &names_after),
+            "the loc `$ref$` name set must be served from the cache, not rebuilt"
+        );
+        assert!(
+            names_after.contains("my_idea"),
+            "and it must still be right"
+        );
+        assert!(
+            fallback_cache_hits(&backend),
+            "the completion fallback list must still be a cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_an_export_bumps_and_invalidates() {
+        let backend = test_backend();
+        let uri = ideas_uri();
+        index(&backend, &uri, "my_idea = {\n\tcost = 5\n}\n");
+        let settled = revision(&backend);
+        let names_before = backend.loc_ref_names();
+        seed_fallback_cache(&backend);
+
+        index(
+            &backend,
+            &uri,
+            "my_idea = {\n\tcost = 5\n}\nanother_idea = {\n\tcost = 1\n}\n",
+        );
+
+        assert_ne!(revision(&backend), settled, "a new definition is an export");
+        assert!(!fallback_cache_hits(&backend));
+        let names_after = backend.loc_ref_names();
+        assert!(!Arc::ptr_eq(&names_before, &names_after));
+        assert!(names_after.contains("another_idea"));
+    }
+
+    #[tokio::test]
+    async fn renaming_an_export_bumps_and_invalidates() {
+        let backend = test_backend();
+        let uri = ideas_uri();
+        index(&backend, &uri, "my_idea = {\n\tcost = 5\n}\n");
+        let settled = revision(&backend);
+        seed_fallback_cache(&backend);
+
+        index(&backend, &uri, "renamed_idea = {\n\tcost = 5\n}\n");
+
+        assert_ne!(revision(&backend), settled, "a rename moves two names");
+        assert!(!fallback_cache_hits(&backend));
+        let names = backend.loc_ref_names();
+        assert!(names.contains("renamed_idea"));
+        assert!(!names.contains("my_idea"), "the old name must be gone");
+    }
+
+    #[tokio::test]
+    async fn removing_every_export_bumps_and_invalidates() {
+        let backend = test_backend();
+        let uri = ideas_uri();
+        index(&backend, &uri, "my_idea = {\n\tcost = 5\n}\n");
+        let settled = revision(&backend);
+        seed_fallback_cache(&backend);
+
+        // What a deleted definition (or a file emptied on disk before a
+        // watched revalidate) leaves behind.
+        index(&backend, &uri, "\n");
+
+        assert_ne!(revision(&backend), settled);
+        assert!(!fallback_cache_hits(&backend));
+        assert!(
+            !backend.loc_ref_names().contains("my_idea"),
+            "a removed definition must not keep resolving"
+        );
+    }
+
+    /// The completion fallback list is built from `variable_counts` and
+    /// `event_target_counts`, so those two families have to move the revision
+    /// on their own. They are exports the type index never sees.
+    #[tokio::test]
+    async fn defined_variables_and_event_targets_bump_the_revision() {
+        let backend = test_backend();
+        let uri = ideas_uri();
+        index(&backend, &uri, "my_idea = {\n\tcost = 5\n}\n");
+
+        let settled = revision(&backend);
+        seed_fallback_cache(&backend);
+        index(&backend, &uri, "@my_var = 3\nmy_idea = {\n\tcost = 5\n}\n");
+        assert_ne!(revision(&backend), settled, "an @-var is an export");
+        assert!(!fallback_cache_hits(&backend));
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .variable_counts
+                .contains_key("@my_var")
+        );
+
+        let settled = revision(&backend);
+        seed_fallback_cache(&backend);
+        index(
+            &backend,
+            &uri,
+            "@my_var = 3\nmy_idea = {\n\tsave_event_target_as = my_target\n}\n",
+        );
+        assert_ne!(revision(&backend), settled, "an event target is an export");
+        assert!(!fallback_cache_hits(&backend));
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .event_target_counts
+                .contains_key("my_target")
+        );
+    }
+
+    /// A file that exports nothing on either side is the one case where a
+    /// first index does not bump, and it is correct: neither cache reads
+    /// anything it contributes.
+    #[tokio::test]
+    async fn a_file_with_no_exports_never_bumps() {
+        let backend = test_backend();
+        let uri = format!("{WORKSPACE_URI}/events/some_events.txt");
+        let before = revision(&backend);
+        index(&backend, &uri, "country_event = {\n\tid = test.1\n}\n");
+        assert_eq!(revision(&backend), before);
+        index(&backend, &uri, "country_event = {\n\tid = test.2\n}\n");
+        assert_eq!(revision(&backend), before);
     }
 }
 

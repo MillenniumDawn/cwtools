@@ -450,6 +450,13 @@ pub(crate) struct DocumentState {
     /// user is in a state where the AST is stale and every completion
     /// falls through to the fallback, but info/rules haven't moved since
     /// the last build, so the cache hit saves a full workspace walk.
+    ///
+    /// A single-file reindex bumps this only when that file's export
+    /// fingerprint moved (`index_parsed_file`). Every consumer is built from
+    /// the type-instance names, defined variables and saved event targets the
+    /// fingerprint covers, so an edit inside a rule body leaves both caches
+    /// valid. Ruleset loads, index prunes and deletions still bump
+    /// unconditionally: they change inputs no per-file fingerprint describes.
     pub(crate) info_revision: AtomicU64,
     /// Cached fallback list (the flat type/enum/var dump reached when
     /// context-aware matching returns nothing).
