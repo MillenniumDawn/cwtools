@@ -1268,14 +1268,11 @@ pub fn ignore_glob_match(pattern: &str, name: &str, relative: &str) -> bool {
     }
 }
 
-/// True if `logical_path` (root-relative, forward-slashed) is excluded by the
-/// engine baseline or `extra_file_globs`. Shared by the workspace walk and the
-/// LSP's open-document gate so they agree on what is ignored.
+/// Excluded by engine baseline or `extra_file_globs`.
 pub fn is_ignored_logical_path(logical_path: &str, extra_file_globs: &[String]) -> bool {
     let cfg = FileManagerConfig::default();
-    // Normalize Windows separators so a raw `a\b\c.txt` is handled even if the
-    // caller didn't go through `compute_logical_path` (the LSP always forwards
-    // `logical_path_from_uri` which is already slash-normalized).
+    // Handle Windows separators.
+
     let normalized = if logical_path.contains('\\') {
         logical_path.replace('\\', "/")
     } else {
@@ -1290,9 +1287,7 @@ pub fn is_ignored_logical_path(logical_path: &str, extra_file_globs: &[String]) 
             .any(|pat| ignore_glob_match(pat, file_name, &normalized))
 }
 
-/// True if the file at `path` under `root` would be excluded by the engine
-/// baseline plus `extra_file_globs`. Convenience wrapper that derives the
-/// logical path from `root`.
+/// Like `is_ignored_logical_path` but derives logical path from `root`.
 pub fn is_ignored_file(
     root: &std::path::Path,
     path: &std::path::Path,

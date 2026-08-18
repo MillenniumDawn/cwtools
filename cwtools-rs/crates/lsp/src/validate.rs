@@ -635,9 +635,7 @@ impl Backend {
         }
     }
 
-    /// True if `uri` would be excluded by the workspace scan (engine baseline
-    /// plus `ignoreFilePatterns`). Uses the same predicate as
-    /// `walk_workspace_files` via `is_ignored_logical_path`.
+    /// Workspace scan would exclude `uri`.
     pub(crate) fn is_ignored_uri(&self, uri: &str) -> bool {
         let cfg = self.state.config.read();
         let logical = logical_path_from_uri(uri, &cfg.workspace_prefix);
@@ -647,14 +645,9 @@ impl Backend {
         )
     }
 
-    /// Clear all index state for `uri` as if it had never been indexed: type
-    /// index, variable/event exports, per-doc token set, `<type>` use tracking,
-    /// and both loc overlays. The workspace scan left an ignored file out, so
-    /// an ignored open document must not leave definitions visible to files
-    /// the scan says cannot see them.
+    /// Drop all index state for `uri`.
     pub(crate) fn clear_ignored_file_state(&self, uri: &str) {
-        // FileIndex relative path is derived from config/roots, so compute it
-        // before taking the info lock to avoid holding config + info together.
+        // Compute file_index path before locking info.
         let rel = self.workspace_rel_for_file_index(uri);
         let bump_info = {
             let mut info = self.state.info_service.write();
@@ -710,9 +703,7 @@ impl Backend {
         parsed: &ParsedFile,
         parsed_version: Option<i32>,
     ) {
-        // Defensive: an ignored file must never enter the type index. The
-        // workspace scan left it out, so indexing it on open would make its
-        // definitions visible to files the scan says cannot see them.
+        // Ignored files must not enter the index.
         if self.is_ignored_uri(uri) {
             self.clear_ignored_file_state(uri);
             return;
@@ -1229,8 +1220,7 @@ impl Backend {
                 })
                 .collect()
         };
-        // Defensive: never revalidate an ignored document. The scan left it
-        // out, so its definitions must stay invisible.
+        // Skip ignored.
         others.retain(|(uri, _, _, _)| !self.is_ignored_uri(uri));
         if others.is_empty() {
             return;
