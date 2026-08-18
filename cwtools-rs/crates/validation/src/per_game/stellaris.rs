@@ -161,7 +161,11 @@ fn walk_if_else(
             // unchanged). The squiggle covers the same span, since the body is
             // not what's deprecated.
             let key_range = key_token_range(block.range.start, key_len(table, key));
-            let fix = SuggestedFix::replace("Rename to set_name", key_range, "set_name");
+            let fix = SuggestedFix::replace(
+                cwtools_i18n::t(cwtools_i18n::Key::ActionRenameToSetName),
+                key_range,
+                "set_name",
+            );
             errors.push(
                 ValidationError::from_code(
                     &error_codes::CW253_DEPRECATED_SET_NAME,

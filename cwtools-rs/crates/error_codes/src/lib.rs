@@ -1,8 +1,15 @@
 //! Shared error-code catalog for cwtools.
 //!
-//! Leaf crate (depends on nothing) so both `cwtools_validation` and
-//! `cwtools_localization` can use the same CW### codes without a dependency
+//! Depends only on `cwtools_i18n` (itself a leaf) so both `cwtools_validation`
+//! and `cwtools_localization` can use the same CW### codes without a dependency
 //! cycle (validation depends on localization).
+//!
+//! Every message here is the English one. The translations live in
+//! [`mod@translations`] beside it, and [`ErrorCode::message`] picks the one for
+//! the locale the LSP was started in; nothing sets a locale in the CLI, so
+//! batch runs and the corpus baselines stay English.
+
+mod translations;
 
 /// Severity of a diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,13 +50,31 @@ pub fn doc_url(id: &str) -> String {
     format!("{DOC_URL}#{}", id.to_ascii_lowercase())
 }
 
+/// CW223's HOI4 wording ([`CW223_INCORRECT_NOT_USAGE_HOI4_MSG`]) in the active
+/// locale. The pair is one diagnostic with two English messages, so the second
+/// one needs the same treatment [`ErrorCode::message`] gives the first.
+pub fn cw223_hoi4_message() -> &'static str {
+    translations::template(translations::CW223_HOI4_KEY)
+        .unwrap_or(CW223_INCORRECT_NOT_USAGE_HOI4_MSG)
+}
+
 impl ErrorCode {
+    /// This code's template in the active locale, falling back to the English
+    /// `message_template` for a code that locale hasn't translated. Use it
+    /// wherever a template is read directly rather than through
+    /// [`format`](Self::format); `message_template` itself stays English, which
+    /// is what the reference doc and the CLI's `--explain` want.
+    pub fn message(&self) -> &'static str {
+        translations::template(self.id).unwrap_or(self.message_template)
+    }
+
     /// Substitute each `{}` placeholder in the template with the next param,
     /// in order (positional, like `format!`). Extra `{}` are left as-is.
     pub fn format(&self, params: &[impl AsRef<str>]) -> String {
-        let mut result = String::with_capacity(self.message_template.len());
+        let template = self.message();
+        let mut result = String::with_capacity(template.len());
         let mut it = params.iter();
-        let mut chars = self.message_template.chars().peekable();
+        let mut chars = template.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '{' && chars.peek() == Some(&'}') {
                 chars.next(); // consume '}'
@@ -710,3 +735,148 @@ pub const CW603_RULES_INVALID_DIRECTIVE: ErrorCode = ErrorCode {
 };
 
 // error_code_hash deleted: no callers, and it wasn't actually a hash.
+
+// ── The catalog as a list ──────────────────────────────
+//
+// The consts above are the definitions; this is the one enumeration of them,
+// paired with the const name so a caller can derive a rule name from it. The
+// CLI validates `--ignore-code`/`--only-code` against it and builds its SARIF
+// rule metadata from it, and `mod translations` checks its tables against it.
+// `catalog_lists_every_code` in the CLI fails when a new `pub const … :
+// ErrorCode` here is not added below.
+
+macro_rules! catalog {
+    ($($name:ident),+ $(,)?) => {
+        /// Known diagnostic codes, including wired and pending checks, with the
+        /// const each is declared as.
+        pub const CATALOG: &[(&str, ErrorCode)] = &[
+            $((stringify!($name), $name),)+
+        ];
+    };
+}
+
+catalog![
+    CW001_PARSE_ERROR,
+    CW100_MISSING_LOCALISATION,
+    CW104_INCORRECT_TRIGGER_SCOPE,
+    CW105_INCORRECT_EFFECT_SCOPE,
+    CW106_INCORRECT_SCOPE_SCOPE,
+    CW107_EVENT_EVERY_TICK,
+    CW108_RESEARCH_LEADER_AREA,
+    CW109_RESEARCH_LEADER_TECH,
+    CW110_TECH_CAT_MISSING,
+    CW113_MISSING_FILE,
+    CW120_POSSIBLE_PRETRIGGER,
+    CW121_EMPTY_IF,
+    CW122_LOC_KEY_IN_INLINE,
+    CW220_UNSAVED_EVENT_TARGET,
+    CW221_MAYBE_UNSAVED_EVENT_TARGET,
+    CW222_UNDEFINED_EVENT,
+    CW223_INCORRECT_NOT_USAGE,
+    CW225_UNDEFINED_LOC_REFERENCE,
+    CW226_INVALID_LOC_COMMAND,
+    CW227_UNKNOWN_SECTION_TEMPLATE,
+    CW228_MISSING_SECTION_SLOT,
+    CW229_UNKNOWN_COMPONENT_TEMPLATE,
+    CW230_MISMATCHED_COMPONENT_AND_SLOT,
+    CW231_UNUSED_TECH,
+    CW233_UNDEFINED_ENTITY,
+    CW234_REPLACE_ME_LOC,
+    CW235_ZERO_MODIFIER,
+    CW236_DEPRECATED_ELSE,
+    CW237_AMBIGUOUS_IF_ELSE,
+    CW238_IF_ELSE_ORDER,
+    CW239_UNUSED_TYPE,
+    CW240_UNEXPECTED_VALUE,
+    CW242_WRONG_NUMBER,
+    CW243_TARGET_WRONG_SCOPE,
+    CW244_INVALID_TARGET,
+    CW245_ERROR_IN_TARGET,
+    CW246_UNSET_VARIABLE,
+    CW247_RULE_WRONG_SCOPE,
+    CW248_INVALID_SCOPE_COMMAND,
+    CW250_PLANET_KILLER_MISSING,
+    CW251_UNNECESSARY_BOOLEAN,
+    CW253_DEPRECATED_SET_NAME,
+    CW254_WRONG_ENCODING,
+    CW255_MISSING_LOC_FILE_LANG,
+    CW256_MISSING_LOC_FILE_LANG_HEADER,
+    CW257_LOC_FILE_LANG_MISMATCH,
+    CW259_RECURSIVE_LOC_REF,
+    CW260_LOC_COMMAND_WRONG_SCOPE,
+    CW261_DUPLICATE_TYPE_DEF,
+    CW262_UNEXPECTED_PROPERTY_NODE,
+    CW263_UNEXPECTED_PROPERTY_LEAF,
+    CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+    CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
+    CW266_LOC_COMMAND_NOT_IN_DATA_TYPE,
+    CW267_UNEXPECTED_ALIAS_KEY_VALUE,
+    CW268_LOC_MISSING_QUOTE,
+    CW269_OPTIMISATION_MERGE_LIST,
+    CW270_VARIABLE_TOO_SMALL,
+    CW271_VARIABLE_INT_ONLY,
+    CW272_FROM_RULES_CUSTOM_ERROR,
+    CW273_UNDEFINED_MODIFIER_TYPE,
+    CW274_INLINE_SCRIPT_ERROR,
+    CW275_LOC_INVALID_CHARS,
+    CW276_LOC_KEY_INVALID_CHARS,
+    CW277_ALIAS_BRANCH_LIMIT,
+    CW280_REDUNDANT_DEFAULT_FIELD,
+    CW281_EMPTY_LIMIT,
+    CW282_REDUNDANT_DEFAULT_BOOL,
+    CW500_TYPE_NOT_FOUND,
+    CW600_RULES_FILE_UNREADABLE,
+    CW601_RULES_UNDEFINED_REFERENCE,
+    CW602_RULES_UNEXPANDED_ALIAS,
+    CW603_RULES_INVALID_DIRECTIVE,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The list above is hand-written, so a code declared without a line in it
+    /// would be invisible to `--ignore-code` and to the translation tables.
+    /// Diff the two straight from the source rather than trusting the list.
+    #[test]
+    fn catalog_covers_supported_error_code_consts() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        )
+        .expect("this crate's own source");
+        const RETIRED_CODES: &[&str] = &["CW258_LOC_FILE_LANG_WRONG_PLACE"];
+
+        let mut declared: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let (name, ty) = l.strip_prefix("pub const ")?.split_once(':')?;
+                ty.trim_start().starts_with("ErrorCode").then_some(name)
+            })
+            .filter(|name| !RETIRED_CODES.contains(name))
+            .collect();
+        declared.sort_unstable();
+        let mut listed: Vec<&str> = CATALOG.iter().map(|(name, _)| *name).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            declared, listed,
+            "CATALOG must list every supported ErrorCode const in this file"
+        );
+    }
+
+    #[test]
+    fn format_substitutes_positionally() {
+        assert_eq!(
+            CW100_MISSING_LOCALISATION.format(&["my_key", "english"]),
+            "Localisation key my_key is not defined for english"
+        );
+    }
+
+    #[test]
+    fn the_default_locale_answers_in_english() {
+        assert_eq!(
+            CW271_VARIABLE_INT_ONLY.message(),
+            CW271_VARIABLE_INT_ONLY.message_template
+        );
+        assert_eq!(cw223_hoi4_message(), CW223_INCORRECT_NOT_USAGE_HOI4_MSG);
+    }
+}

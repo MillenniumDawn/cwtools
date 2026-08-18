@@ -31,7 +31,11 @@ use cwtools_string_table::string_table::StringTable;
 /// v6: Leaf records the exact value range.
 /// v7: dropped ruleset shape from the fingerprint. A `.cwt` edit cannot change
 /// how a script file parses, so it must not clear the directory.
-const CACHE_VERSION: u32 = 7;
+/// v8: folded the display locale into the fingerprint. The `.cwe` sidecar holds
+/// each file's diagnostics as finished strings, and those are written in the
+/// language the server was started in, so a cache built under one locale would
+/// otherwise be served verbatim under another.
+const CACHE_VERSION: u32 = 8;
 
 /// Whether platform metadata provides a reliable no-read change stamp.
 pub const PATH_METADATA_CACHE_SUPPORTED: bool = cfg!(unix);
@@ -105,6 +109,10 @@ pub fn source_cache_key(path: &Path) -> Option<SourceCacheKey> {
 /// directory is stale and must be cleared. The ruleset is not part of this:
 /// a `.cwb` entry is a parsed AST, which does not depend on `.cwt` rules.
 pub fn settings_fingerprint(language: &str, workspace_root: &Path) -> u64 {
+    fingerprint(language, workspace_root, cwtools_i18n::locale().tag())
+}
+
+fn fingerprint(language: &str, workspace_root: &Path, locale: &str) -> u64 {
     // A record separator between fields so concatenation is unambiguous
     // (`a` + `bc` can't collide with `ab` + `c`).
     let mut h = FNV_OFFSET;
@@ -117,6 +125,9 @@ pub fn settings_fingerprint(language: &str, workspace_root: &Path) -> u64 {
         std::path::absolute(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf())
     });
     h = fnv1a(workspace_root.to_string_lossy().as_bytes(), h);
+    h = sep(h);
+    // Display locale — the `.cwe` sidecar stores rendered diagnostic text.
+    h = fnv1a(locale.as_bytes(), h);
     h = sep(h);
     // Bump version together so a format change also invalidates.
     fnv1a(&CACHE_VERSION.to_le_bytes(), h)
@@ -702,6 +713,15 @@ mod tests {
         assert_ne!(base, settings_fingerprint("stellaris", root));
         // A workspace-root change must invalidate.
         assert_ne!(base, settings_fingerprint("hoi4", Path::new("/tmp/other")));
+        // So must a display-locale change: the `.cwe` sidecar holds rendered
+        // diagnostics, which are written in the locale's language. Driven
+        // through `fingerprint` rather than the process-global locale so this
+        // stays independent of whatever else is running in the test binary.
+        assert_ne!(
+            fingerprint("hoi4", root, "en"),
+            fingerprint("hoi4", root, "de")
+        );
+        assert_eq!(base, fingerprint("hoi4", root, "en"));
         let absolute = fs::canonicalize(".").unwrap();
         assert_eq!(
             settings_fingerprint("hoi4", Path::new(".")),

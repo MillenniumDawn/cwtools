@@ -71,7 +71,7 @@ pub fn check_missing_localisation(
                     continue;
                 }
                 let fix = SuggestedFix::create_loc_key(
-                    format!("Create localisation key {expected}"),
+                    cwtools_i18n::format(cwtools_i18n::Key::ActionCreateLoc, &[&expected]),
                     &expected,
                 );
                 errors.push(

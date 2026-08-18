@@ -360,6 +360,7 @@ name = "cwtools_cache"
 version = "2.6.0"
 dependencies = [
  "cwtools_file_manager",
+ "cwtools_i18n",
  "cwtools_parser",
  "cwtools_string_table",
  "rkyv",
@@ -416,6 +417,9 @@ dependencies = [
 [[package]]
 name = "cwtools_error_codes"
 version = "2.6.0"
+dependencies = [
+ "cwtools_i18n",
+]
 
 [[package]]
 name = "cwtools_file_manager"
@@ -438,6 +442,10 @@ dependencies = [
  "smallvec",
  "tracing",
 ]
+
+[[package]]
+name = "cwtools_i18n"
+version = "2.6.0"
 
 [[package]]
 name = "cwtools_index"
@@ -493,6 +501,7 @@ dependencies = [
  "cwtools_error_codes",
  "cwtools_file_manager",
  "cwtools_game",
+ "cwtools_i18n",
  "cwtools_info",
  "cwtools_localization",
  "cwtools_parser",
@@ -562,6 +571,7 @@ dependencies = [
  "cwtools_error_codes",
  "cwtools_file_manager",
  "cwtools_game",
+ "cwtools_i18n",
  "cwtools_index",
  "cwtools_localization",
  "cwtools_parser",

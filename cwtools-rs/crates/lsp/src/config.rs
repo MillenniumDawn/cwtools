@@ -165,23 +165,42 @@ fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// The display language the client asked for, as a BCP-47 tag.
+///
+/// LSP 3.16's `locale` is the one to use: `vscode-languageclient` fills it from
+/// `vscode.env.language` with no help from the extension. A client that sends
+/// neither can pass the same tag in `initializationOptions.locale` instead,
+/// which is also the seam a test drives.
+fn locale_tag(params: &InitializeParams) -> Option<&str> {
+    params.locale.as_deref().or_else(|| {
+        params
+            .initialization_options
+            .as_ref()
+            .and_then(|opts| opts.get("locale"))
+            .and_then(|v| v.as_str())
+    })
+}
+
 /// The user-visible `reloadrulesconfig` status. The client toasts this string
 /// verbatim, so the wording is the contract: each half (rules loaded or not,
 /// revalidation ran / queued / still pending) must report honestly.
 fn reload_status_message(loaded: bool, outcome: ScanOutcome, dir: &std::path::Path) -> String {
-    let status = match outcome {
-        ScanOutcome::Ran => "workspace re-validated",
+    let status = cwtools_i18n::t(match outcome {
+        ScanOutcome::Ran => cwtools_i18n::Key::StatusRevalidated,
         // The rules themselves are live either way; only the re-validation
         // against them is outstanding, and the two wordings say whether
         // anything is still going to land.
-        ScanOutcome::Cancelled => "re-validation cancelled",
-        ScanOutcome::Busy if loaded => "re-validation queued behind the running scan",
-        ScanOutcome::Busy => "re-validation still pending (a scan is running)",
-    };
+        ScanOutcome::Cancelled => cwtools_i18n::Key::StatusRevalidationCancelled,
+        ScanOutcome::Busy if loaded => cwtools_i18n::Key::StatusRevalidationQueued,
+        ScanOutcome::Busy => cwtools_i18n::Key::StatusRevalidationPending,
+    });
     if loaded {
-        format!("Rules config reloaded; {status}.")
+        cwtools_i18n::format(cwtools_i18n::Key::CommandRulesReloaded, &[status])
     } else {
-        format!("No rules loaded from {}; {status}.", dir.display())
+        cwtools_i18n::format(
+            cwtools_i18n::Key::CommandNoRulesLoaded,
+            &[&dir.display().to_string(), status],
+        )
     }
 }
 
@@ -245,6 +264,20 @@ impl Backend {
                 format!("★ CWTools Rust LSP server v{}", env!("CARGO_PKG_VERSION")),
             )
             .await;
+        // Display language, for everything the server says back. Set here,
+        // before the first scan, so nothing user-facing is built in the wrong
+        // language.
+        if let Some(tag) = locale_tag(&params) {
+            let locale = cwtools_i18n::Locale::from_tag(tag);
+            cwtools_i18n::set_locale(locale);
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("locale: {} (from {})", locale.tag(), tag),
+                )
+                .await;
+        }
+
         // Store language from init options
         if let Some(opts) = &params.initialization_options {
             if let Some(lang) = opts.get("language").and_then(|v| v.as_str()) {
@@ -1378,9 +1411,9 @@ impl Backend {
                 .validate_entire_workspace_tracked(false, Some(&progress))
                 .await;
         }
-        let status = match outcome {
-            ScanOutcome::Ran => "workspace re-indexed",
-            ScanOutcome::Busy => "re-index still pending (another scan is running)",
+        let status = cwtools_i18n::t(match outcome {
+            ScanOutcome::Ran => cwtools_i18n::Key::StatusReindexed,
+            ScanOutcome::Busy => cwtools_i18n::Key::StatusReindexPending,
             ScanOutcome::Cancelled => {
                 // The purge already happened and the in-memory base-game index
                 // is gone with it, so stopping here would serve "not found" for
@@ -1389,16 +1422,23 @@ impl Backend {
                 // `reloadrulesconfig` uses: cancelling should cost the user
                 // their wait, not their diagnostics.
                 self.spawn_deferred_revalidation("clearAllCaches");
-                "re-index cancelled, rebuilding in the background"
+                cwtools_i18n::Key::StatusReindexCancelledRebuilding
             }
-        };
+        });
         let msg = if failures.is_empty() {
-            format!("Caches cleared ({removed} files); {status}.")
+            cwtools_i18n::format(
+                cwtools_i18n::Key::CommandCachesCleared,
+                &[&removed.to_string(), status],
+            )
         } else {
-            format!(
-                "Caches cleared ({removed} files) with {} error(s); {status}. Failed: {}",
-                failures.len(),
-                failures.join("; ")
+            cwtools_i18n::format(
+                cwtools_i18n::Key::CommandCachesClearedWithErrors,
+                &[
+                    &removed.to_string(),
+                    &failures.len().to_string(),
+                    status,
+                    &failures.join("; "),
+                ],
             )
         };
         progress.finish(Some(msg.clone())).await;
@@ -1414,7 +1454,7 @@ impl Backend {
         let dir = self.state.config.read().rules_dir.clone();
         let Some(dir) = dir else {
             return Ok(Some(Value::String(
-                "No rules directory configured; nothing to reload.".to_string(),
+                cwtools_i18n::t(cwtools_i18n::Key::CommandNoRulesDirectory).to_string(),
             )));
         };
         let progress =
@@ -1495,11 +1535,11 @@ impl Backend {
                 .validate_entire_workspace_tracked(false, Some(&progress))
                 .await;
         }
-        let msg = match outcome {
-            ScanOutcome::Ran => "Workspace re-indexed.",
-            ScanOutcome::Busy => "Re-index already in progress.",
-            ScanOutcome::Cancelled => "Re-index cancelled.",
-        }
+        let msg = cwtools_i18n::t(match outcome {
+            ScanOutcome::Ran => cwtools_i18n::Key::CommandWorkspaceReindexed,
+            ScanOutcome::Busy => cwtools_i18n::Key::CommandReindexInProgress,
+            ScanOutcome::Cancelled => cwtools_i18n::Key::CommandReindexCancelled,
+        })
         .to_string();
         progress.finish(Some(msg.clone())).await;
         Ok(Some(Value::String(msg)))
@@ -1613,6 +1653,30 @@ mod tests {
     use super::*;
     use cwtools_localization::Lang;
     use serde_json::json;
+
+    #[test]
+    fn locale_tag_prefers_the_protocol_field_over_the_init_option() {
+        let with_option = InitializeParams {
+            initialization_options: Some(json!({ "locale": "fr" })),
+            ..Default::default()
+        };
+        assert_eq!(locale_tag(&with_option), Some("fr"));
+
+        let with_both = InitializeParams {
+            locale: Some("de".to_string()),
+            initialization_options: Some(json!({ "locale": "fr" })),
+            ..Default::default()
+        };
+        assert_eq!(locale_tag(&with_both), Some("de"));
+
+        // A client that sends neither leaves the server in English.
+        assert_eq!(locale_tag(&InitializeParams::default()), None);
+        let wrong_type = InitializeParams {
+            initialization_options: Some(json!({ "locale": 5 })),
+            ..Default::default()
+        };
+        assert_eq!(locale_tag(&wrong_type), None);
+    }
 
     #[test]
     fn extract_ignored_error_codes_lowercases_and_drops_empties() {

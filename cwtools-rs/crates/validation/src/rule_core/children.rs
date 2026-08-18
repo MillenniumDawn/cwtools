@@ -122,7 +122,7 @@ fn validate_leaf_against_rule(
                             // `leaf.pos` spans key→value; its end lands at the next
                             // token, taking the line and its newline with it.
                             let fix = cwtools_parser::fix::SuggestedFix::delete(
-                                "Remove redundant default",
+                                cwtools_i18n::t(cwtools_i18n::Key::ActionRemoveRedundantDefault),
                                 leaf.pos,
                             );
                             errors.push(
@@ -669,7 +669,7 @@ fn count_and_validate_children<'r>(
                             rules.iter().filter_map(|(rt, _)| get_rule_key(rt)),
                         ) {
                             err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
-                                format!("Did you mean '{}'?", cand),
+                                cwtools_i18n::format(cwtools_i18n::Key::ActionDidYouMean, &[cand]),
                                 cwtools_parser::ast::SourceRange {
                                     start: leaf.pos.start,
                                     end: key_token_end(leaf, key, table),

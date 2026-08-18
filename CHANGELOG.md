@@ -1,8 +1,20 @@
 # unreleased
 
+## Features
+
+- The server speaks Arabic, French, German, Italian, Spanish, Simplified Chinese and Traditional Chinese. It reads the display language from the `locale` the client sends in `initialize` (`initializationOptions.locale` also works for a client that sends neither), and answers in it: the 64 diagnostic messages that carry English text of their own, the scan progress and status-bar phases, the `reloadrulesconfig` / `clearAllCaches` / `reindexWorkspace` result toasts, the ten code-action titles, and the hover's `Scope` / `Resolves to` / `Required scopes` / `Localisation` / `Description` labels. A code or key a language has not translated falls back to English rather than showing a placeholder, and nothing sets a locale in the CLI, so batch runs, SARIF and the corpus baselines stay English. Paradox script keywords are left alone throughout: `NOT`/`NOR`/`AND`, `ROOT`/`PREV`/`FROM`, `set_name`, `l_language.yml`, `mean_time_to_happen` and the `CWxxx` codes all read the same in every language. (MillenniumDawn/cwtools-vscode#118)
+
 ## Bug Fixes
 
 - LSP: a document the editor spells differently from the workspace scan is no longer indexed twice. On Windows that was every open file — VS Code writes the drive as a lower-case letter with a percent-encoded colon (`file:///d%3A/…`) where the scan writes `file:///D:/…` — so CW261 reported every instance of a `## unique` type in an opened file as defined twice, squiggling focus trees and scripted-effect files end to end. Both the encoding and the drive-letter case now fold onto one spelling, for the workspace folder as well as the documents inside it. (#319)
+
+## Notes
+
+- **Behavioral:** the parse cache fingerprint (`CACHE_VERSION`) moves to 8 and now includes the display locale. The `.cwe` sidecar stores each file's diagnostics as finished text, so a cache written in one language would otherwise be replayed verbatim in another. Existing caches are a clean miss on first run after upgrading, and changing the editor's display language costs one cold re-index.
+
+## Developer
+
+- The diagnostic catalog is enumerated once, as `cwtools_error_codes::CATALOG`, instead of being hand-mirrored in the CLI. `crates/cli/src/codes.rs` reads it, and the test that diffed the mirror against the consts moved to `error_codes` beside both.
 
 # 2.6.0
 

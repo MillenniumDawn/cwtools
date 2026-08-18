@@ -348,8 +348,13 @@ pub(crate) fn build_hover_markdown(
     }
 
     // Section 2 — required scopes ("where it's allowed").
-    let required = (!rule_scopes.is_empty())
-        .then(|| format!("**Required scopes**: {}", rule_scopes.join(", ")));
+    let required = (!rule_scopes.is_empty()).then(|| {
+        format!(
+            "**{}**: {}",
+            cwtools_i18n::t(cwtools_i18n::Key::HoverRequiredScopes),
+            rule_scopes.join(", ")
+        )
+    });
 
     // Section 3 — the current scope at the cursor ("where you are"), independent
     // of the rule's required scope. Related scopes (ROOT/PREV and the FROM chain)
@@ -357,11 +362,19 @@ pub(crate) fn build_hover_markdown(
     // F# build showed. Root/Prev are suppressed when identical to the current
     // scope (noise); FROM/FROM.FROM are always shown when present.
     let scope_table = scopes.current.map(|scope| {
-        let mut scope_lines = vec![format!("**Scope**: {}", scope)];
+        let mut scope_lines = vec![format!(
+            "**{}**: {}",
+            cwtools_i18n::t(cwtools_i18n::Key::HoverScope),
+            scope
+        )];
         // The scope the hovered link/keyword resolves to, when the setting asks
         // for it and it actually differs from the ambient scope. (#37)
         if let Some(resolved) = scopes.resolved.filter(|r| Some(*r) != scopes.current) {
-            scope_lines.push(format!("**Resolves to**: {}", resolved));
+            scope_lines.push(format!(
+                "**{}**: {}",
+                cwtools_i18n::t(cwtools_i18n::Key::HoverResolvesTo),
+                resolved
+            ));
         }
         if let Some(root) = scopes.root.filter(|r| Some(*r) != scopes.current) {
             scope_lines.push(format!("**Root**: {}", root));
@@ -434,10 +447,22 @@ pub(crate) fn append_localisation(
         }
     };
     if let Some(nk) = name_key {
-        emit(&nk, "\n\n---\n\n**Localisation**:");
+        emit(
+            &nk,
+            &format!(
+                "\n\n---\n\n**{}**:",
+                cwtools_i18n::t(cwtools_i18n::Key::HoverLocalisation)
+            ),
+        );
     }
     if let Some(dk) = desc_key {
-        emit(&dk, "\n\n**Description**:");
+        emit(
+            &dk,
+            &format!(
+                "\n\n**{}**:",
+                cwtools_i18n::t(cwtools_i18n::Key::HoverDescription)
+            ),
+        );
     }
 }
 

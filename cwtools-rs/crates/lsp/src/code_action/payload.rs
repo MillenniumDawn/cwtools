@@ -260,7 +260,7 @@ pub(super) fn fix_all_action(
     let mut changes = HashMap::new();
     changes.insert(uri.clone(), text_edits);
     Some(CodeActionOrCommand::CodeAction(CodeAction {
-        title: format!("Fix all ({} auto-fixable)", kept.len()),
+        title: cwtools_i18n::format(cwtools_i18n::Key::ActionFixAll, &[&kept.len().to_string()]),
         kind: Some(CodeActionKind::SOURCE_FIX_ALL),
         diagnostics: Some(resolved),
         edit: Some(WorkspaceEdit {

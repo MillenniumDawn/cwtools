@@ -65,7 +65,10 @@ pub fn validate_hoi4(
             // Fix: delete the whole redundant `key = { always = <default> }`
             // field. `block.range` spans the leaf; its end lands at the start of
             // the next token, so the line (and its newline) go with it.
-            let fix = SuggestedFix::delete(format!("Remove redundant {key}"), block.range);
+            let fix = SuggestedFix::delete(
+                cwtools_i18n::format(cwtools_i18n::Key::ActionRemoveRedundant, &[&key]),
+                block.range,
+            );
             errors.push(
                 ValidationError::from_code(
                     &error_codes::CW280_REDUNDANT_DEFAULT_FIELD,
