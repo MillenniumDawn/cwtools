@@ -126,7 +126,7 @@ fn build_subtype(
 fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
     find_directive(comments, key)
         .filter(|s| !s.is_empty())
-        .map(|s| strip_quotes(s).to_string())
+        .map(str::to_string)
 }
 
 fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {

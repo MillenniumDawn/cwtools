@@ -198,16 +198,15 @@ pub(crate) fn process_type_node(
 /// `skip_root_key` stay body-only: nothing writes them as directives, and
 /// `skip_root_key` has block and leaf forms that don't map onto a comment line.
 fn apply_option_directives(def: &mut TypeDefinition, comments: &[String]) {
-    let yes = |key: &str| find_directive(comments, key).is_some_and(|v| strip_quotes(v) == "yes");
+    let yes = |key: &str| find_directive(comments, key) == Some("yes");
     def.unique = yes("unique");
     def.type_per_file = yes("type_per_file");
     def.path_options.path_strict = yes("path_strict");
     // The directive is spelled `should_be_used`; the field it feeds is named
     // `should_be_referenced` (see the body-loop arm comment, #204).
     def.should_be_referenced = yes("should_be_used");
-    def.warning_only =
-        find_directive(comments, "severity").is_some_and(|v| strip_quotes(v) == "warning");
-    def.starts_with = find_directive(comments, "starts_with").map(|v| strip_quotes(v).to_string());
+    def.warning_only = find_directive(comments, "severity") == Some("warning");
+    def.starts_with = find_directive(comments, "starts_with").map(str::to_string);
 }
 
 /// Block form: `skip_root_key = { A B }`.
