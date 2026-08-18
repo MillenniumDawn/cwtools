@@ -197,30 +197,11 @@ impl Backend {
                 std::mem::replace(&mut *merged, uris)
             };
 
-            // CW113 resolves a `filepath` against the mod's files and the base
-            // game's as one set, so both halves are indexed here, in the same
-            // write that publishes the merge. Case-insensitive: the editor has
-            // no equivalent of the CLI's --case-sensitive-files. With no
-            // workspace folder there is no mod half and the check stays silent,
-            // as it does on a mod-only CLI run.
-            let workspace_root = self.state.config.read().workspace_roots.first().cloned();
-            let file_index = workspace_root.and_then(|root| {
-                let paths = self.state.vanilla_file_paths.lock().take()?;
-                Some(cwtools_driver::build_file_index(
-                    &root,
-                    cwtools_driver::VanillaFiles::Cached(paths),
-                    false,
-                ))
-            });
-
             let mut info_guard = self.state.info_service.write();
             // Drop the previous base-game contribution (a re-merge after
             // cacheVanilla / clearAllCaches) before merging the fresh one.
             info_guard.type_index.remove_files(&old);
             info_guard.type_index.merge_base_game_with_uris(converted);
-            if let Some(file_index) = file_index {
-                info_guard.type_index.file_index = file_index;
-            }
             // Vanilla data is loaded, so the index now holds every base-game
             // instance. Mark it complete so the CW500/CW222 type-reference
             // checks fire (they're gated on `complete` to avoid false
@@ -234,6 +215,38 @@ impl Backend {
             drop(info_guard);
             self.bump_info_revision();
         }
+
+        // CW113 resolves a `filepath` against the mod's files and the base
+        // game's as one set, so both halves are indexed together. The merge
+        // above handles the type instances; the file index is rebuilt on every
+        // scan where vanilla is available so the workspace half stays current
+        // (new/deleted files between scans, or a rescan after vanilla was
+        // already merged). Case-insensitive: the editor has no equivalent of
+        // the CLI's --case-sensitive-files. With no workspace folder there is
+        // no mod half and the check stays silent, as does a mod-only run with
+        // no base game. Clone, not take, so the next scan can rebuild again.
+        let workspace_root = match self.state.config.read().workspace_roots.first().cloned() {
+            Some(r) => r,
+            None => return,
+        };
+        let vanilla_paths = match self.state.vanilla_file_paths.lock().clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let file_index = cwtools_driver::build_file_index(
+            &workspace_root,
+            cwtools_driver::VanillaFiles::Cached(vanilla_paths),
+            false,
+        );
+        {
+            let mut info_guard = self.state.info_service.write();
+            info_guard.type_index.file_index = file_index;
+        }
+        // The file index now reflects the current workspace tree. Bump so
+        // CW113 and icon completions see the refreshed set. When had_pending
+        // was true we already bumped for the type merge, but the file index
+        // write above needs its own bump.
+        self.bump_info_revision();
     }
 
     /// Lazily index the base-game install into `vanilla_index` (once). Resolves
