@@ -412,7 +412,7 @@ pub(crate) fn append_localisation(
     let loc_key = |s: &str| {
         let s = s.trim();
         if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-            s[1..s.len() - 1].to_lowercase()
+            s[1..s.len() - 1].trim().to_lowercase()
         } else {
             s.to_lowercase()
         }
@@ -929,6 +929,23 @@ mod tests {
             &PositionElement::Leaf {
                 key: "has_country_flag".to_string(),
                 value: " \"my_war_flag\" ".to_string(),
+            },
+            &loc_map_with(&[("my_war_flag", "War Flag")]),
+        );
+        assert!(md.contains("War Flag"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_append_localisation_inner_whitespace_with_quotes() {
+        // Inner whitespace inside the quotes is also trimmed. Defensive:
+        // a value that arrives as `" my_war_flag "` (e.g. from a forgiving
+        // formatter) should still preview, and `"   "` collapses to empty.
+        let mut md = String::new();
+        append_localisation(
+            &mut md,
+            &PositionElement::Leaf {
+                key: "has_country_flag".to_string(),
+                value: "\" my_war_flag \"".to_string(),
             },
             &loc_map_with(&[("my_war_flag", "War Flag")]),
         );
