@@ -297,6 +297,11 @@ pub struct VarIndex {
     /// LSP can drop a name on `clear_file` only when its last definition goes,
     /// while the bulk CLI path (which never removes) just keeps incrementing.
     names: HashMap<String, usize>,
+    /// Base-game variables staged from the vanilla cache or a live walk of the
+    /// install. Distinct from `names` so a `clear_file` on a mod file that
+    /// shares a name does not strip the base-game definition, and a re-merge
+    /// replaces the previous contribution instead of double-counting (#306).
+    vanilla_names: FxHashSet<String>,
 }
 
 impl VarIndex {
@@ -305,11 +310,17 @@ impl VarIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names.is_empty() && self.vanilla_names.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.names.len()
+        let mut len = self.names.len();
+        for v in &self.vanilla_names {
+            if !self.names.contains_key(v) {
+                len += 1;
+            }
+        }
+        len
     }
 
     /// Canonical lookup key for a raw variable token: lowercased, unquoted, the
@@ -358,8 +369,27 @@ impl VarIndex {
         NORM_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             Self::normalize_into(raw, &mut buf);
-            self.names.contains_key(buf.as_str())
+            self.names.contains_key(buf.as_str()) || self.vanilla_names.contains(buf.as_str())
         })
+    }
+
+    /// Replace the base-game contribution with `names` (normalized). A re-merge
+    /// drops the previous set before inserting the fresh one, so the count does
+    /// not inflate, and a name the mod also defines survives a `clear_file` on
+    /// that mod file (#306).
+    pub fn set_vanilla_names(&mut self, names: Vec<String>) {
+        self.vanilla_names.clear();
+        for raw in names {
+            let n = Self::normalize(&raw);
+            if !n.is_empty() {
+                self.vanilla_names.insert(n);
+            }
+        }
+    }
+
+    /// Drop the base-game contribution (e.g. on `clearAllCaches`).
+    pub fn clear_vanilla_names(&mut self) {
+        self.vanilla_names.clear();
     }
 
     /// Fold another index's names into this one (e.g. base-game variables into
@@ -373,6 +403,16 @@ impl VarIndex {
     /// The normalized defined names, for persisting to the vanilla cache.
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.names.keys()
+    }
+
+    /// Base-game names staged via [`set_vanilla_names`](Self::set_vanilla_names).
+    pub fn vanilla_names_iter(&self) -> impl Iterator<Item = &String> {
+        self.vanilla_names.iter()
+    }
+
+    /// All distinct normalized variable names (workspace + base game).
+    pub fn all_names(&self) -> impl Iterator<Item = &String> {
+        self.names.keys().chain(self.vanilla_names.iter())
     }
 }
 
@@ -564,7 +604,7 @@ impl TypeIndex {
         self.name_counts
             .keys()
             .map(AsRef::as_ref)
-            .chain(self.var_index.names().map(String::as_str))
+            .chain(self.var_index.all_names().map(String::as_str))
     }
 
     /// Every `(type_name, instance)` defined in `file_uri`. Used by

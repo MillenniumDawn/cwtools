@@ -138,10 +138,7 @@ impl Backend {
         let cwtools_info::vanilla_cache::VanillaCacheAux {
             loc_keys,
             file_paths,
-            // Base-game script variables. The LSP's var index is refcounted per
-            // file, so folding a rootless set into it needs its own bookkeeping
-            // (#306); the live path drops them too, so this changes nothing.
-            var_names: _,
+            var_names,
             complex_enum_values,
             value_set_values,
         } = aux;
@@ -152,6 +149,7 @@ impl Backend {
             *self.state.vanilla_loc_keys.lock() = Some(loc_keys);
         }
         *self.state.vanilla_file_paths.lock() = Some(file_paths);
+        *self.state.vanilla_var_names.lock() = Some(var_names);
         self.merge_vanilla_dynamic_values(complex_enum_values, value_set_values);
         total
     }
@@ -213,6 +211,18 @@ impl Backend {
             // ensure_vanilla_index does not re-run on the next scan.
             self.state.vanilla_merged.store(true, Ordering::SeqCst);
             drop(info_guard);
+            self.bump_info_revision();
+        }
+
+        // Base-game variables as a distinct provenance, so a re-merge replaces
+        // the previous set instead of double-counting and a `clear_file` on a
+        // mod file that shares a name does not strip the vanilla definition
+        // (#306). Installed here rather than during the per-type merge so it
+        // does not depend on the type instances being pending.
+        if let Some(var_names) = self.state.vanilla_var_names.lock().clone() {
+            let mut info = self.state.info_service.write();
+            info.type_index.var_index.set_vanilla_names(var_names);
+            drop(info);
             self.bump_info_revision();
         }
 

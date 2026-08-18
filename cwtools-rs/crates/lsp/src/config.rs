@@ -1295,7 +1295,13 @@ impl Backend {
         *self.state.vanilla_index.lock() = None;
         *self.state.vanilla_loc_keys.lock() = None;
         *self.state.vanilla_file_paths.lock() = None;
+        *self.state.vanilla_var_names.lock() = None;
         *self.state.vanilla_loc.lock() = None;
+        {
+            let mut info = self.state.info_service.write();
+            info.type_index.var_index.clear_vanilla_names();
+        }
+        self.bump_info_revision();
         // ensure_vanilla_index turns the loading bar on but, unlike a full
         // workspace scan, this command never reaches the code that turns
         // it off. The guard covers both exits: the normal one below, and
@@ -1348,7 +1354,13 @@ impl Backend {
         *self.state.vanilla_index.lock() = None;
         *self.state.vanilla_loc_keys.lock() = None;
         *self.state.vanilla_file_paths.lock() = None;
+        *self.state.vanilla_var_names.lock() = None;
         *self.state.vanilla_loc.lock() = None;
+        {
+            let mut info = self.state.info_service.write();
+            info.type_index.var_index.clear_vanilla_names();
+        }
+        self.bump_info_revision();
         // A `Busy` scan (e.g. the periodic background pass) started before this
         // purge and may already be past its vanilla-index phase, so it can't be
         // trusted to rebuild what we just dropped — retry until we win the CAS
