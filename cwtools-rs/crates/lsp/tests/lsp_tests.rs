@@ -2667,6 +2667,30 @@ fn test_hover_idea_definition_shows_name_and_desc() {
 }
 
 #[test]
+fn test_hover_value_field_previews_localisation() {
+    // #317: a leaf whose right-hand is `value[...]` (e.g. a script variable
+    // reference like `has_country_flag = "my_war_flag"`) must preview the
+    // localisation the value resolves to, the same way a `name = my_idea`
+    // (LocalisationField) reference does. The right-hand classification is
+    // `VariableGetField("country_flag")` here, not the scalar/localisation path.
+    let hover = hover_markdown(
+        &[(
+            "test_l_english.yml",
+            "l_english:\n my_war_flag:0 \"War Flag\"\n",
+        )],
+        "common/decisions/test.txt",
+        "my_dec = {\n    allowed = { has_country_flag = \"my_war_flag\" }\n    cost = 1\n}\n",
+        1,
+        36,
+        serde_json::json!({}),
+    );
+    assert!(
+        hover.contains("War Flag"),
+        "hover on a value[...] flag must preview the loc key, got: {hover}"
+    );
+}
+
+#[test]
 fn test_hover_default_hides_other_languages() {
     // Default (hoverShowAllLanguages off): only the primary language is shown.
     let hover = hover_markdown(
