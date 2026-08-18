@@ -505,3 +505,231 @@ impl Backend {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use cwtools_info::vanilla_cache::{VanillaCacheAux, VanillaCacheData};
+
+    use crate::state::DocumentState;
+
+    fn test_backend() -> Backend {
+        let state = Arc::new(DocumentState::new());
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let slot = captured.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = tower_lsp::LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let client = captured.lock().take().unwrap();
+        Backend { client, state }
+    }
+
+    fn vanilla_data(var_names: Vec<&str>) -> VanillaCacheData {
+        VanillaCacheData {
+            per_type: HashMap::new(),
+            aux: VanillaCacheAux {
+                loc_keys: Vec::new(),
+                file_paths: Vec::new(),
+                var_names: var_names.into_iter().map(|s| s.to_string()).collect(),
+                complex_enum_values: Vec::new(),
+                value_set_values: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn stage_and_merge_installs_vanilla_vars() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_var"]));
+        // Before merge the live var_index is still empty.
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("vanilla_var")
+        );
+        backend.merge_pending_vanilla_index();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("vanilla_var")
+        );
+    }
+
+    #[test]
+    fn re_merge_replaces_not_accumulates() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["old_var"]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("old_var")
+        );
+        backend.stage_vanilla_payload(vanilla_data(vec!["new_var"]));
+        backend.merge_pending_vanilla_index();
+        let idx = backend.state.info_service.read();
+        assert!(
+            !idx.type_index.var_index.contains("old_var"),
+            "re-merge must replace"
+        );
+        assert!(idx.type_index.var_index.contains("new_var"));
+    }
+
+    #[test]
+    fn clear_file_on_shared_name_does_not_strip_vanilla() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["shared_var"]));
+        backend.merge_pending_vanilla_index();
+        // Simulate a mod file defining the same var.
+        {
+            let mut info = backend.state.info_service.write();
+            info.type_index.var_index.add_name("shared_var");
+        }
+        // Simulate the LSP clearing that mod file.
+        {
+            let mut info = backend.state.info_service.write();
+            info.type_index.var_index.remove_name("shared_var");
+        }
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("shared_var"),
+            "vanilla must survive mod clear_file on same name"
+        );
+    }
+
+    #[test]
+    fn clear_all_caches_drops_vanilla_vars() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_var"]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("vanilla_var")
+        );
+        // Mimic clearAllCaches path.
+        *backend.state.vanilla_var_names.lock() = None;
+        backend
+            .state
+            .info_service
+            .write()
+            .type_index
+            .var_index
+            .clear_vanilla_names();
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("vanilla_var")
+        );
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn staged_empty_vanilla_clears_previous() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["a"]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("a")
+        );
+        backend.stage_vanilla_payload(vanilla_data(vec![]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("a")
+        );
+    }
+
+    #[test]
+    fn vanilla_vars_reach_loc_bindable_names() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_loc_var"]));
+        backend.merge_pending_vanilla_index();
+        let idx = backend.state.info_service.read();
+        let names: std::collections::HashSet<String> =
+            idx.type_index.loc_bindable_names().collect();
+        assert!(names.contains("vanilla_loc_var"));
+    }
+
+    #[test]
+    fn vanilla_vars_are_scoped_by_var_checks_gate() {
+        // The loc field's var check is gated on `!var_index.is_empty()` —
+        // vanilla alone must make the index non-empty so the gate opens.
+        let backend = test_backend();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .is_empty()
+        );
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_only"]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .is_empty()
+        );
+        // Also verify vanilla_merged prevents re-index but not var install.
+        assert!(backend.state.vanilla_merged.load(Ordering::SeqCst));
+    }
+}

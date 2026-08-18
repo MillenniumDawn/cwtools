@@ -1519,4 +1519,23 @@ mod tests {
         assert!(all.contains("shared"));
         assert!(all.contains("vanilla"));
     }
+
+    #[test]
+    fn var_index_add_name_normalizes_compound() {
+        // add_name normalizes the same way as set_vanilla_names, exercising
+        // the thread-local buffer path for mod-defined vars.
+        let mut vi = VarIndex::new();
+        vi.add_name("\"My_Var\"");
+        assert!(vi.contains("my_var"), "quoted stripped");
+        vi.add_name("My_Var@GER");
+        assert!(vi.contains("my_var"), "@ suffix stripped");
+        vi.add_name("foo.bar?100");
+        assert!(vi.contains("bar"), "dot + ? selector stripped");
+        vi.add_name("baz^2");
+        assert!(vi.contains("baz"));
+        // My_Var and My_Var@GER collapse to the same key, so 4 adds -> 3 distinct.
+        assert_eq!(vi.len(), 3);
+        vi.add_name("   ");
+        assert_eq!(vi.len(), 3, "empty/whitespace skipped");
+    }
 }
