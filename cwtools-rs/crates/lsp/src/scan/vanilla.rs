@@ -219,6 +219,7 @@ impl Backend {
         // mod file that shares a name does not strip the vanilla definition
         // (#306). Installed here rather than during the per-type merge so it
         // does not depend on the type instances being pending.
+        // Clone, not take — must survive across scans like file_paths (see below).
         if let Some(var_names) = self.state.vanilla_var_names.lock().clone() {
             let mut info = self.state.info_service.write();
             info.type_index.var_index.set_vanilla_names(var_names);

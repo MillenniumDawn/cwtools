@@ -313,6 +313,7 @@ impl VarIndex {
         self.names.is_empty() && self.vanilla_names.is_empty()
     }
 
+    // distinct union; shared counts once
     pub fn len(&self) -> usize {
         let mut len = self.names.len();
         for v in &self.vanilla_names {
@@ -392,8 +393,8 @@ impl VarIndex {
         self.vanilla_names.clear();
     }
 
-    /// Fold another index's names into this one (e.g. base-game variables into
-    /// the mod's index).
+    /// Folds only `names` (workspace provenance); vanilla stays separate —
+    /// use `set_vanilla_names` for base-game.
     pub fn merge(&mut self, other: &VarIndex) {
         for (name, count) in &other.names {
             *self.names.entry(name.clone()).or_insert(0) += count;
@@ -406,13 +407,18 @@ impl VarIndex {
     }
 
     /// Base-game names staged via [`set_vanilla_names`](Self::set_vanilla_names).
-    pub fn vanilla_names_iter(&self) -> impl Iterator<Item = &String> {
+    #[allow(dead_code)]
+    pub(crate) fn vanilla_names_iter(&self) -> impl Iterator<Item = &String> {
         self.vanilla_names.iter()
     }
 
-    /// All distinct normalized variable names (workspace + base game).
-    pub fn all_names(&self) -> impl Iterator<Item = &String> {
-        self.names.keys().chain(self.vanilla_names.iter())
+    /// Distinct union of workspace + base-game names (shared filtered).
+    pub(crate) fn all_names(&self) -> impl Iterator<Item = &String> {
+        self.names.keys().chain(
+            self.vanilla_names
+                .iter()
+                .filter(|k| !self.names.contains_key(*k)),
+        )
     }
 }
 
