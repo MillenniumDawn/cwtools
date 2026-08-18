@@ -11,6 +11,23 @@ fn path_uri(path: impl AsRef<std::path::Path>) -> String {
         .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
+/// A canonical URI rewritten the way VS Code spells it: on Windows the drive
+/// letter is lower-cased and its colon percent-encoded (`file:///d%3A/…`), which
+/// is not what `Url::from_file_path` writes (#319). A no-op elsewhere, where the
+/// two already agree.
+fn client_spelling(uri: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = uri.strip_prefix("file:///")
+            && let Some((drive, tail)) = rest.split_once(':')
+            && drive.len() == 1
+        {
+            return format!("file:///{}%3A{tail}", drive.to_ascii_lowercase());
+        }
+    }
+    uri.to_string()
+}
+
 /// Scratch home for every server this binary spawns. It has to outlive the
 /// children, so it is a static: leaking the dir at process exit is the point,
 /// the OS temp cleaner takes it from there.
@@ -272,6 +289,106 @@ fn test_lsp_unknown_notification_does_not_crash() {
 
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     assert_eq!(resp["id"], 99);
+}
+
+// ── Client URI spellings fold onto one index key (#319) ──────────────────────
+
+/// A client may spell a `file:` URI differently from `Url::from_file_path`
+/// without naming a different file — VS Code percent-encodes the Windows drive
+/// colon (`file:///d%3A/…`), and percent-encoding is legal for any path byte.
+/// Every index the server keeps is a map on the raw URI string, so a spelling
+/// it does not fold is a second key for a file it already has: the workspace
+/// scan's "skip documents the editor has open" guard misses, the file is
+/// indexed twice, and CW261 reports every instance of a `## unique` type in it
+/// as defined twice.
+///
+/// Encoding a plain letter (`dup.txt` → `%64up.txt`) exercises the same fold on
+/// every platform; the drive-letter half is covered by the `paths` unit tests.
+/// The workspace folder is sent in the client's spelling too, because
+/// `workspace_prefix` is derived from it and every logical path is stripped
+/// against it.
+#[test]
+fn test_did_open_folds_a_percent_encoded_uri_onto_the_canonical_one() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+
+    let rel_path = "common/decisions/dup.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    let text = "my_decision = {\n    cost = 5\n}\n";
+    std::fs::write(&file_path, text).unwrap();
+
+    let canonical_uri = path_uri(&file_path);
+    // The client's spelling: same file, `d` written as `%64`.
+    let client_uri = client_spelling(&canonical_uri).replace("dup.txt", "%64up.txt");
+    assert_ne!(client_uri, canonical_uri, "the spellings must differ");
+    let client_root = client_spelling(&path_uri(ws.path()));
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": client_root,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": client_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+
+    // The URI the diagnostics come back under is the key the document was
+    // indexed under, so it is what proves the fold happened.
+    let mut published = None;
+    for _ in 0..400 {
+        let raw = match read_frame(&mut reader) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "textDocument/publishDiagnostics"
+            && let Some(u) = v["params"]["uri"].as_str()
+            && u.ends_with("up.txt")
+        {
+            published = Some(u.to_string());
+            break;
+        }
+    }
+    child.kill().ok();
+
+    assert_eq!(
+        published.as_deref(),
+        Some(canonical_uri.as_str()),
+        "did_open must key the document by the canonical URI, not the client's spelling"
+    );
 }
 
 // ── Context-aware completion round-trips ─────────────────────────────────────

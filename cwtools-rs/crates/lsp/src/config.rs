@@ -408,11 +408,21 @@ impl Backend {
 
         // Store workspace URI: prefer workspace_folders (multi-root aware), fall
         // back to the legacy root_uri field for clients that only send that.
+        // Canonicalised like the document URIs (#319): `workspace_prefix` is
+        // derived from the primary folder and stripped off canonical document
+        // URIs by a plain compare, so a client spelling that differs from
+        // `path_to_uri` — VS Code's `file:///d%3A/mod` against the round trip's
+        // `file:///D:/mod` — would leave every logical path unstripped.
         let folders: Vec<String> = match &params.workspace_folders {
-            Some(folders) if !folders.is_empty() => {
-                folders.iter().map(|f| f.uri.to_string()).collect()
-            }
-            _ => params.root_uri.iter().map(|u| u.to_string()).collect(),
+            Some(folders) if !folders.is_empty() => folders
+                .iter()
+                .map(|f| crate::paths::canonical_uri(f.uri.as_str()))
+                .collect(),
+            _ => params
+                .root_uri
+                .iter()
+                .map(|u| crate::paths::canonical_uri(u.as_str()))
+                .collect(),
         };
         if let Some(root) = folders.first() {
             let mut cfg = self.state.config.write();
@@ -924,17 +934,20 @@ impl Backend {
         &self,
         params: DidChangeWorkspaceFoldersParams,
     ) {
+        // Both lists in the canonical spelling `initialize_impl` stored, so the
+        // removal compare below still recognises the primary folder and a new
+        // primary keys its `workspace_prefix` the way documents are keyed (#319).
         let removed: Vec<String> = params
             .event
             .removed
             .iter()
-            .map(|f| f.uri.to_string())
+            .map(|f| crate::paths::canonical_uri(f.uri.as_str()))
             .collect();
         let added: Vec<String> = params
             .event
             .added
             .iter()
-            .map(|f| f.uri.to_string())
+            .map(|f| crate::paths::canonical_uri(f.uri.as_str()))
             .collect();
         let current = self.state.config.read().workspace_uri.clone();
         let current = current.as_deref().map(str::to_string);

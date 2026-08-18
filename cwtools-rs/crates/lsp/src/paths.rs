@@ -16,10 +16,90 @@ pub(crate) fn uri_to_path_str(uri: &str) -> String {
 /// Convert a filesystem path to a `file://` URI, percent-encoding special
 /// characters. Uses the `url` crate so paths with spaces or non-ASCII round-trip
 /// correctly through `uri_to_path_str`.
+///
+/// This is the canonical spelling every index keys on; see
+/// [`canonical_uri`] for why that matters.
 pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
     Url::from_file_path(path)
         .map(|u| u.to_string())
         .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
+/// Fold a client-supplied URI to the spelling [`path_to_uri`] produces.
+///
+/// Every index the server keeps — `documents`, `InfoService::files`,
+/// `TypeIndex::file_positions`, the loc overlays, the semantic-token cache —
+/// is a map keyed on the raw URI string, and `InfoService::clear_file` drops a
+/// file's previous contribution by that same string. So one file reaching the
+/// server under two spellings is indexed twice and never de-duplicated.
+///
+/// That is not hypothetical: VS Code spells the Windows drive as a lower-case
+/// letter with a percent-encoded colon (`file:///d%3A/mod/x.txt`) while the
+/// workspace scan builds its keys with `Url::from_file_path`
+/// (`file:///D:/mod/x.txt`), and the `url` crate decodes neither into the
+/// other. The scan's "skip documents the editor already has open" guard is a
+/// string compare, so on Windows it never matched: every open file was indexed
+/// a second time from disk, and CW261 reported every instance of a `## unique`
+/// type in it as defined twice.
+///
+/// Returns the input unchanged for anything that is not a convertible `file:`
+/// URI (untitled buffers, virtual documents), so those keep working as before.
+/// On Windows that includes a drive-less absolute URI (`file:///a/b.txt`),
+/// which names no path there and so has no canonical form to fold onto.
+///
+/// What gets folded is whatever the URI → path → URI round trip normalises, and
+/// on Windows that is the drive letter's *case* as well as the percent-encoding:
+/// `std::path` reports `Prefix::Disk` upper-cased and `Url::from_file_path`
+/// writes what it reports, so all four of `d%3A`, `D%3A`, `d:` and `D:` land on
+/// the single `D:` key. That is the point rather than a side effect — the
+/// client's spelling and the scan's have to become the same string. Any URI the
+/// server emits on Windows was already going through `Url::from_file_path`, so
+/// the case it hands back to the client does not change; VS Code re-normalises
+/// a `file:` URI to its own spelling on parse either way.
+///
+/// The workspace folder URI is canonicalised at the same boundary (see
+/// `Backend::initialize_impl`), because `Config::workspace_prefix` is derived
+/// from it and [`logical_path_from_uri`] strips that prefix with a plain
+/// case-sensitive compare against these canonical document URIs.
+pub(crate) fn canonical_uri(uri: &str) -> String {
+    if let Ok(url) = Url::parse(uri)
+        && let Some(canonical) = canonical_url(&url)
+    {
+        return canonical.into();
+    }
+    uri.to_string()
+}
+
+/// The canonical form of `url`, or `None` when it is already canonical or is
+/// not a `file:` URI that converts to a path. See [`canonical_uri`].
+fn canonical_url(url: &Url) -> Option<Url> {
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    let canonical = path_to_uri(&path);
+    if canonical == url.as_str() {
+        return None;
+    }
+    Url::parse(&canonical).ok()
+}
+
+/// In-place [`canonical_uri`] for a URI arriving inside request params, applied
+/// at the `LanguageServer` boundary so no handler ever keys on a client's own
+/// spelling. A no-op when the URI is already canonical.
+pub(crate) fn canonicalize_url(url: &mut Url) {
+    if let Some(canonical) = canonical_url(url) {
+        *url = canonical;
+    }
+}
+
+/// [`canonicalize_url`] for the workspace-edit params, whose URIs are plain
+/// `String`s rather than `Url`s.
+pub(crate) fn canonicalize_uri_string(uri: &mut String) {
+    let canonical = canonical_uri(uri);
+    if *uri != canonical {
+        *uri = canonical;
+    }
 }
 
 /// Normalized, decoded workspace path prefix for [`logical_path_from_uri`],
@@ -950,6 +1030,164 @@ mod tests {
         let ws = Some(workspace_prefix_of("file:///home/user/My%20Mod"));
         let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
+    }
+
+    // ── canonical_uri (#319) ──────────────────────────────────────────────
+
+    /// A client's spelling of a file, and the path it names. On Windows that is
+    /// what VS Code sends — lower-case drive, percent-encoded colon; elsewhere
+    /// an encoded ordinary path byte, since there is no drive to encode.
+    /// Expectations are written against [`path_to_uri`] of the path rather than
+    /// a literal, because *which* spelling wins is the platform's business (on
+    /// Windows the round trip also upper-cases the drive letter) and only the
+    /// fold onto one key is this module's contract.
+    #[cfg(windows)]
+    const CLIENT_URI: &str = "file:///d%3A/a/b.txt";
+    #[cfg(not(windows))]
+    const CLIENT_URI: &str = "file:///a/%62.txt";
+
+    /// The canonical spelling of the file [`CLIENT_URI`] names.
+    fn client_uri_canonical() -> String {
+        #[cfg(windows)]
+        let path = std::path::Path::new(r"d:\a\b.txt");
+        #[cfg(not(windows))]
+        let path = std::path::Path::new("/a/b.txt");
+        path_to_uri(path)
+    }
+
+    #[test]
+    fn canonical_uri_folds_a_client_spelling_onto_path_to_uri() {
+        assert_eq!(
+            canonical_uri(CLIENT_URI),
+            client_uri_canonical(),
+            "the client's spelling must fold onto the path_to_uri spelling"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_is_idempotent_and_matches_path_to_uri() {
+        #[cfg(not(windows))]
+        let path = std::path::Path::new("/home/user/My Mod/events/foo.txt");
+        #[cfg(windows)]
+        let path = std::path::Path::new(r"d:\Users\user\My Mod\events\foo.txt");
+        let canonical = path_to_uri(path);
+        assert_eq!(canonical_uri(&canonical), canonical);
+        // A space stays percent-encoded; canonicalising must not decode it into
+        // an invalid URI.
+        assert!(canonical.contains("%20"), "got: {canonical}");
+    }
+
+    #[test]
+    fn canonical_uri_passes_through_what_it_cannot_convert() {
+        // Not a URI at all, and a scheme with no filesystem path behind it.
+        assert_eq!(canonical_uri("not a uri"), "not a uri");
+        assert_eq!(
+            canonical_uri("untitled:Untitled-1"),
+            "untitled:Untitled-1",
+            "untitled buffers have no path and must survive unchanged"
+        );
+    }
+
+    /// Percent-encoding of an ordinary path byte folds on every platform, which
+    /// is what makes the end-to-end test in `lsp_tests.rs` portable. The URI
+    /// needs a drive on Windows, where a drive-less one names no path at all.
+    #[test]
+    fn canonical_uri_decodes_an_encoded_path_letter() {
+        #[cfg(windows)]
+        let (encoded, decoded) = (
+            "file:///d:/a/%64up.txt",
+            path_to_uri(std::path::Path::new(r"d:\a\dup.txt")),
+        );
+        #[cfg(not(windows))]
+        let (encoded, decoded) = (
+            "file:///a/%64up.txt",
+            path_to_uri(std::path::Path::new("/a/dup.txt")),
+        );
+        assert_eq!(canonical_uri(encoded), decoded);
+    }
+
+    /// The fold the double-index bug needed: every way a client can spell the
+    /// Windows drive is one key. Which case survives is the round trip's call
+    /// (today, upper), so assert they agree rather than naming a winner.
+    #[cfg(windows)]
+    #[test]
+    fn canonical_uri_folds_every_drive_letter_spelling_onto_one_key() {
+        let canonical = canonical_uri("file:///d%3A/a/b.txt");
+        for spelling in [
+            "file:///D%3A/a/b.txt",
+            "file:///d:/a/b.txt",
+            "file:///D:/a/b.txt",
+        ] {
+            assert_eq!(
+                canonical_uri(spelling),
+                canonical,
+                "{spelling} must share one index key with file:///d%3A/a/b.txt"
+            );
+        }
+        // And that key is idempotent under a second fold.
+        assert_eq!(canonical_uri(&canonical), canonical);
+    }
+
+    #[test]
+    fn canonicalize_url_rewrites_in_place() {
+        let expected = client_uri_canonical();
+        let mut url: Url = CLIENT_URI.parse().unwrap();
+        canonicalize_url(&mut url);
+        assert_eq!(url.as_str(), expected);
+        // Second application changes nothing.
+        canonicalize_url(&mut url);
+        assert_eq!(url.as_str(), expected);
+    }
+
+    #[test]
+    fn canonicalize_uri_string_rewrites_in_place() {
+        let mut uri = CLIENT_URI.to_string();
+        canonicalize_uri_string(&mut uri);
+        assert_eq!(uri, client_uri_canonical());
+    }
+
+    /// The workspace folder URI has to be folded at the same boundary the
+    /// documents are: `workspace_prefix` comes from it, and
+    /// [`logical_path_from_uri`] strips that prefix off canonical document URIs
+    /// with a plain compare. `workspace_prefix_of` percent-decodes, so encoding
+    /// alone never mattered here — the Windows drive-letter case does.
+    #[test]
+    fn workspace_prefix_of_a_canonical_folder_uri_strips_a_canonical_document() {
+        #[cfg(windows)]
+        let (client_folder, doc) = (
+            "file:///d%3A/mod",
+            path_to_uri(std::path::Path::new(r"d:\mod\events\foo.txt")),
+        );
+        #[cfg(not(windows))]
+        let (client_folder, doc) = (
+            "file:///home/user/%6Dod",
+            path_to_uri(std::path::Path::new("/home/user/mod/events/foo.txt")),
+        );
+        let prefix = Some(workspace_prefix_of(&canonical_uri(client_folder)));
+        assert_eq!(logical_path_from_uri(&doc, &prefix), "events/foo.txt");
+    }
+
+    /// Why the fold matters here rather than being merely tidy: on Windows the
+    /// prefix and the document URI can disagree on the drive-letter case, and
+    /// `strip_prefix` is a plain byte compare — a miss leaves every logical path
+    /// as the absolute one, so no open document resolves a type or a rule.
+    /// Canonicalising both ends makes every combination agree.
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_folder_prefix_strips_a_document_whatever_case_the_client_used() {
+        for folder in ["file:///d%3A/mod", "file:///D%3A/mod", "file:///D:/mod"] {
+            let prefix = Some(workspace_prefix_of(&canonical_uri(folder)));
+            for doc in [
+                "file:///d%3A/mod/events/foo.txt",
+                "file:///D:/mod/events/foo.txt",
+            ] {
+                assert_eq!(
+                    logical_path_from_uri(&canonical_uri(doc), &prefix),
+                    "events/foo.txt",
+                    "folder {folder} vs document {doc}"
+                );
+            }
+        }
     }
 
     // ── strip_loc_comment (#50) ───────────────────────────────────────────

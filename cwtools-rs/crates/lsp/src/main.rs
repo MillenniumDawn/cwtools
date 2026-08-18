@@ -33,6 +33,7 @@ mod validate;
 
 pub(crate) use cursor::{CursorResolution, RuleCursorInfo, hint_from_rule_right};
 use cursor::{hint_from_rule_left, scope_link_key_type};
+use paths::{canonicalize_uri_string, canonicalize_url};
 pub(crate) use state::{
     AstSnapshot, AstSource, Backend, CompletionCacheEntry, DebounceTask, DeferredRulesMessage,
     DiskState, DocumentState, FileTextSnapshot, FixableEdits, LocLocationMap, LocOverlayWrite,
@@ -616,8 +617,9 @@ impl LanguageServer for Backend {
 
     // --- Text document sync ---
     #[tracing::instrument(skip_all)]
-    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+    async fn did_open(&self, mut params: DidOpenTextDocumentParams) {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document.uri);
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         let version = params.text_document.version;
@@ -667,8 +669,9 @@ impl LanguageServer for Backend {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document.uri);
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
         if uri.len() > MAX_DOCUMENT_URI_BYTES {
@@ -723,7 +726,8 @@ impl LanguageServer for Backend {
         );
     }
 
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+    async fn did_save(&self, mut params: DidSaveTextDocumentParams) {
+        canonicalize_url(&mut params.text_document.uri);
         let uri = params.text_document.uri.to_string();
         self.invalidate_semantic_tokens(&uri);
         // A save isn't an edit, so don't bump the edit counter, just re-read the
@@ -742,7 +746,8 @@ impl LanguageServer for Backend {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+    async fn did_close(&self, mut params: DidCloseTextDocumentParams) {
+        canonicalize_url(&mut params.text_document.uri);
         let uri = params.text_document.uri.to_string();
         self.invalidate_semantic_tokens(&uri);
         tracing::debug!(%uri, "did_close");
@@ -912,12 +917,14 @@ impl LanguageServer for Backend {
 
     // --- Language features ---
 
-    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+    async fn hover(&self, mut params: HoverParams) -> Result<Option<Hover>> {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document_position_params.text_document.uri);
         self.hover_impl(params).await
     }
 
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+    async fn completion(&self, mut params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        canonicalize_url(&mut params.text_document_position.text_document.uri);
         let mut response = self.completion_impl(params).await;
         // Origin labels are stamped once here so every completion path (game
         // script, loc, .cwt) is covered, gated on the client capability.
@@ -943,22 +950,25 @@ impl LanguageServer for Backend {
 
     async fn goto_definition(
         &self,
-        params: GotoDefinitionParams,
+        mut params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document_position_params.text_document.uri);
         self.goto_definition_impl(params).await
     }
 
-    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+    async fn references(&self, mut params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document_position.text_document.uri);
         self.references_impl(params).await
     }
 
     async fn document_symbol(
         &self,
-        params: DocumentSymbolParams,
+        mut params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document.uri);
         self.document_symbol_impl(params).await
     }
 
@@ -970,77 +980,102 @@ impl LanguageServer for Backend {
         self.symbol_impl(params).await
     }
 
-    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+    async fn folding_range(
+        &self,
+        mut params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.folding_range_impl(params).await
     }
 
     async fn document_highlight(
         &self,
-        params: DocumentHighlightParams,
+        mut params: DocumentHighlightParams,
     ) -> Result<Option<Vec<DocumentHighlight>>> {
+        canonicalize_url(&mut params.text_document_position_params.text_document.uri);
         self.document_highlight_impl(params).await
     }
 
     async fn selection_range(
         &self,
-        params: SelectionRangeParams,
+        mut params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.selection_range_impl(params).await
     }
 
-    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+    async fn document_link(
+        &self,
+        mut params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.document_link_impl(params).await
     }
 
     async fn prepare_rename(
         &self,
-        params: TextDocumentPositionParams,
+        mut params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.prepare_rename_impl(params).await
     }
 
-    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+    async fn rename(&self, mut params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        canonicalize_url(&mut params.text_document_position.text_document.uri);
         self.rename_impl(params).await
     }
 
-    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+    async fn code_action(
+        &self,
+        mut params: CodeActionParams,
+    ) -> Result<Option<CodeActionResponse>> {
         self.mark_activity();
+        canonicalize_url(&mut params.text_document.uri);
         self.code_action_impl(params).await
     }
 
-    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+    async fn inlay_hint(&self, mut params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.inlay_hint_impl(params).await
     }
 
     async fn semantic_tokens_full(
         &self,
-        params: SemanticTokensParams,
+        mut params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.semantic_tokens_full_impl(params).await
     }
 
     async fn semantic_tokens_full_delta(
         &self,
-        params: SemanticTokensDeltaParams,
+        mut params: SemanticTokensDeltaParams,
     ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.semantic_tokens_full_delta_impl(params).await
     }
 
     async fn semantic_tokens_range(
         &self,
-        params: SemanticTokensRangeParams,
+        mut params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.semantic_tokens_range_impl(params).await
     }
 
-    async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
+    async fn document_color(
+        &self,
+        mut params: DocumentColorParams,
+    ) -> Result<Vec<ColorInformation>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.document_color_impl(params).await
     }
 
     async fn color_presentation(
         &self,
-        params: ColorPresentationParams,
+        mut params: ColorPresentationParams,
     ) -> Result<Vec<ColorPresentation>> {
+        canonicalize_url(&mut params.text_document.uri);
         self.color_presentation_impl(params).await
     }
 
@@ -1048,19 +1083,25 @@ impl LanguageServer for Backend {
         self.execute_command_impl(params).await
     }
 
-    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+    async fn did_change_watched_files(&self, mut params: DidChangeWatchedFilesParams) {
+        for change in &mut params.changes {
+            canonicalize_url(&mut change.uri);
+        }
         self.did_change_watched_files_impl(params).await;
     }
 
-    async fn did_create_files(&self, params: CreateFilesParams) {
-        for f in &params.files {
+    async fn did_create_files(&self, mut params: CreateFilesParams) {
+        for f in &mut params.files {
+            canonicalize_uri_string(&mut f.uri);
             self.invalidate_semantic_tokens(f.uri.as_str());
         }
         self.request_semantic_refresh().await;
     }
 
-    async fn did_rename_files(&self, params: RenameFilesParams) {
-        for f in &params.files {
+    async fn did_rename_files(&self, mut params: RenameFilesParams) {
+        for f in &mut params.files {
+            canonicalize_uri_string(&mut f.old_uri);
+            canonicalize_uri_string(&mut f.new_uri);
             let old = f.old_uri.as_str();
             let new = f.new_uri.as_str();
             // Move open-document state if the renamed file was open.
@@ -1089,8 +1130,9 @@ impl LanguageServer for Backend {
         self.request_semantic_refresh().await;
     }
 
-    async fn did_delete_files(&self, params: DeleteFilesParams) {
-        for f in &params.files {
+    async fn did_delete_files(&self, mut params: DeleteFilesParams) {
+        for f in &mut params.files {
+            canonicalize_uri_string(&mut f.uri);
             self.invalidate_semantic_tokens(f.uri.as_str());
         }
         self.request_semantic_refresh().await;
