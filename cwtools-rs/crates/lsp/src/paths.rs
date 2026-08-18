@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
     }
 
-    // ── canonical_uri (#317) ──────────────────────────────────────────────
+    // ── canonical_uri (#319) ──────────────────────────────────────────────
 
     /// The spelling VS Code sends on Windows. `to_file_path` decodes `%3A` on
     /// both platforms (`d:\a\b.txt` there, `/d:/a/b.txt` here) and

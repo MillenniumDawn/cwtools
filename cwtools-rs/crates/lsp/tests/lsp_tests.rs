@@ -274,7 +274,7 @@ fn test_lsp_unknown_notification_does_not_crash() {
     assert_eq!(resp["id"], 99);
 }
 
-// ── Client URI spellings fold onto one index key (#317) ──────────────────────
+// ── Client URI spellings fold onto one index key (#319) ──────────────────────
 
 /// A client may spell a `file:` URI differently from `Url::from_file_path`
 /// without naming a different file — VS Code percent-encodes the Windows drive

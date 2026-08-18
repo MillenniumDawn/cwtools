@@ -1,3 +1,9 @@
+# unreleased
+
+## Bug Fixes
+
+- LSP: a document the editor spells differently from the workspace scan is no longer indexed twice. On Windows that was every open file — VS Code percent-encodes the drive colon (`file:///d%3A/…`) where the scan writes it literally — so CW261 reported every instance of a `## unique` type in an opened file as defined twice, squiggling focus trees and scripted-effect files end to end. (#319)
+
 # 2.6.0
 
 ## Features
