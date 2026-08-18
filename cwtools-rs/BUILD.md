@@ -60,6 +60,11 @@ Produces two binaries in `target/release/`:
 - `rules`: parse a `.cwt` rules file or directory and print a summary.
 - `loc`: parse and validate localisation `.yml` files.
 - `fix`: apply the machine-applicable fixes for diagnostics that carry one. Dry-run by default; `--apply` writes.
+- `explain`: print what one `CWxxx` code means, from the same reference `docs/ERROR_CODES.md` holds.
+- `list-codes`: list every diagnostic code with its severity and a one-line summary.
+- `completions`: print a shell completion script (`bash`, `elvish`, `fish`, `powershell`, `zsh`) on stdout.
+
+`--quiet` (`-q`) and `--no-color` are accepted on any subcommand.
 
 ## Build all targets (debug + tests)
 

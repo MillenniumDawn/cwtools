@@ -21,6 +21,8 @@ What runs:
 
 fmt and clippy keep commits fast; the full test suite gates the push. All three
 mirror `.github/workflows/test.yml`, so a green local run means a green CI lint/test.
+Each is filed under `cwtools-rs/**.rs` (clippy and the tests also `.toml`), so a
+docs-only change runs none of them.
 
 Bypass in a pinch with `git commit --no-verify` / `git push --no-verify`, but don't
 make a habit of it. CI runs the same checks plus `cargo machete` and `cargo deny`.
@@ -35,7 +37,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-Coverage is optional while we build history, with an 85% line target:
+Coverage is optional while we build history, with an 85% line target. It needs
+`cargo install cargo-llvm-cov` (CI pins 0.8.7); the script says so and stops if
+it isn't there:
 
 ```sh
 COVERAGE_THRESHOLD=85 bash ../scripts/coverage.sh
@@ -52,7 +56,7 @@ or a validator should run it, because a refactor that was supposed to change
 nothing is easy to believe and hard to prove.
 
 It validates a pinned real mod and diffs the report against a committed
-baseline (`scripts/corpus-baseline.csv`, 4041 diagnostics as of writing). Run it
+baseline (`scripts/corpus-baseline.csv`, 4718 diagnostics as of writing). Run it
 from the repo root, one level up from here:
 
 ```sh

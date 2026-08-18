@@ -3,7 +3,7 @@ A library for parsing, editing, and validating Paradox Interactive script files.
 
 > **Fork notice:** This is a fork of [cwtools/cwtools](https://github.com/cwtools/cwtools). The original F# library (NuGet packages, .NET Standard) lives at the upstream repo. Please give them their love as well for inspiring this wonderful project.
 
-> **Game support:** Right now we predominantly support **Hearts of Iron IV**. The validator is built in Rust (see `cwtools-rs/`) and HOI4 is where it's complete and tested. **Stellaris** also ships native validators (CW108/109/110/120/227/229/250 plus the if/else and set_name checks CW236/237/253). The other games (EU4, CK2/CK3, Vic2/Vic3, Imperator) parse, but their validation and per-game rules are partial while we get the foundation right. Full multi-game parity is tracked in the [issues](https://github.com/MillenniumDawn/cwtools/issues).
+> **Game support:** Right now we predominantly support **Hearts of Iron IV**. The validator is built in Rust (see `cwtools-rs/`) and HOI4 is where it's complete and tested. **Stellaris** also ships native validators (CW108/109/110/120/227/229/231/250 plus the if/else and set_name checks CW236/237/253). The other games (EU4, EU5, CK2/CK3, Vic2/Vic3, Imperator) parse, but their validation and per-game rules are partial while we get the foundation right. Full multi-game parity is tracked in the [issues](https://github.com/MillenniumDawn/cwtools/issues).
 
 ## What it does
 
@@ -17,7 +17,7 @@ Both binaries drive the same pipeline.
 - Completion, hover, goto definition, find references, document highlight, rename.
 - Document and workspace symbols, folding and selection ranges, document links.
 - Quick fixes, fix-all within a document, and `fixAllWorkspace` across every file.
-- Semantic tokens (full and range), inlay hints, and color swatches.
+- Semantic tokens (full, delta and range), inlay hints, and color swatches.
 - Commands to reload the rules, rebuild or clear the caches, re-index, and generate missing localisation stubs.
 - Graph data behind the extension's focus, tech and event tree view.
 - Long commands report progress and can be cancelled mid-run.
@@ -29,6 +29,7 @@ Both binaries drive the same pipeline.
 - `fix` applies the machine-applicable fixes, dry-run by default.
 - `cache-vanilla` pre-indexes a base game install so later runs skip re-parsing it.
 - `parse`, `discover`, `rules`, `serialize` and `deserialize` inspect one file, a tree, or a `.cwb` cache.
+- `explain CWxxx` prints what one code means, `list-codes` prints the whole catalog, and `completions <shell>` writes a completion script.
 - Reports as text, CSV, JSON, GitHub Actions annotations or SARIF, with severity and code filters, hash baselines, and settings from a `cwtools.toml`.
 - `validate --file` and `--since <git-ref>` scope the report to the files you touched, for a pre-commit hook or a PR job.
 
@@ -80,6 +81,7 @@ the incremental per-file index behind its hover, goto and find-references, and
 
 - [Architecture](cwtools-rs/docs/ARCHITECTURE.md) — the crate map, the batch pipeline, the CLI-vs-LSP split, and LSP features like the idle-gated background reindex.
 - [CWXXX error/warning code reference](cwtools-rs/docs/ERROR_CODES.md) — full catalog of diagnostic codes emitted by the Rust validator.
+- [Math expressions](cwtools-rs/docs/MATH_EXPRESSIONS.md) — the HOI4 math-block operators and what the validator enforces inside one.
 - [Profiling guide](cwtools-rs/PROFILING.md) — how to measure validation performance.
 
 ## Projects that use CW Tools

@@ -23,7 +23,8 @@ Then, roughly bottom-up:
 - `parser`: Paradox script text to an arena AST (on `string_table`).
 - `file_manager`: file discovery + parse orchestration (which dirs/files to walk,
   the exclude globs; on `parser`, `string_table`).
-- `cache`: rkyv+zstd on-disk AST cache (`.cwb`) (on `parser`, `string_table`).
+- `cache`: rkyv+zstd on-disk AST cache (`.cwb`), plus the per-file workspace parse
+  cache both front ends share (`workspace.rs`) (on `parser`, `string_table`).
 - `rules`: `.cwt` rule loading, giving a `RuleSet` of types/aliases/enums and
   scope/link inputs (on `game`, `parser`, `string_table`, `error_codes`, `file_manager`).
 - `localization`: `.yml` loc parsing, `LocService`/`LocIndex`, loc reference and
@@ -116,8 +117,8 @@ without expanding it.
 
 A long-running session drifts: files deleted while the server had no watcher event,
 a settings change that only lands on the next scan. To catch that, the LSP runs a
-periodic quiet rescan (`background_reindex_loop` in `scan.rs`, spawned once from
-`initialized`). It re-runs the same `validate_entire_workspace` the startup scan
+periodic quiet rescan (`background_reindex_loop` in `scan/reindex.rs`, spawned once
+from `initialized`). It re-runs the same `validate_entire_workspace` the startup scan
 does, but `quiet`: no loading bar, though diagnostics still publish, so an error
 fixed outside the editor clears.
 
@@ -210,7 +211,8 @@ The largest areas are directory modules, each a thin `mod`/`lib` over focused fi
   themselves), `loc_keys` (the prefix-searchable view of the loc-key union),
   `resolve` (lazy `completionItem/resolve`), over `mod`.
 - `lsp/src/code_action/`: `payload` (Diagnostic.data codec + document quickfix),
-  `create_loc_key` (CW100), `fix_all` (`fixAllWorkspace`), over `mod`.
+  `create_loc_key` (CW100), `fix_all` (`fixAllWorkspace`), `ignore_code` (the
+  "Ignore CWxxx in this workspace" action), over `mod`.
 - `lsp/src/scan/`: `workspace` (the full scan), `reindex` (the quiet background
   pass), `loc` (loc rebuild + display collection), `vanilla` (base-game indexing
   and its loc memo), `watched` (`didChangeWatchedFiles` coalescing), over a `mod`

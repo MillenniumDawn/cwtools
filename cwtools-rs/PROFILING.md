@@ -42,7 +42,8 @@ instrumented hot path, with its busy/idle time. The instrumented paths today:
 - `count_and_validate_children` / `validate_leaf` / `validate_alias_usage` (validation, TRACE) — one span per block, leaf, or alias usage. Off under `RUST_LOG=info`. Set `RUST_LOG=cwtools_validation=trace` to attribute time to a phase inside the file.
 - `merged_rules_for_type` (validation) — one span per typed definition's subtype merge
 - `parse_and_validate` / `index_parsed_file` (lsp) — one span per file the server validates
-- `semantic_tokens_full_impl` / `semantic_tokens_range_impl` (lsp) — one span per semantic-tokens request
+- `semantic_tokens_full_impl` / `semantic_tokens_full_delta_impl` / `semantic_tokens_range_impl` (lsp) — one span per semantic-tokens request
+- the other request and scan entry points (lsp) — `did_open`/`did_change`/`did_close`, `completion_impl` and the completion builders under it, `debounced_validate`, `validate_entire_workspace_inner`, `rebuild_and_publish_loc`, `did_change_watched_files_impl`
 
 Filter to a single crate to cut noise:
 
@@ -116,7 +117,7 @@ covers everything below. Windows separators are accepted in a pattern and read
 the same way.
 
 The CLI exposes the same two lists as repeatable flags:
-`--ignore-file GLOB` and `--ignore-dir GLOB` on `validate`.
+`--ignore-file GLOB` and `--ignore-dir GLOB`, on `validate` and on `loc`.
 
 ## Workspace parse cache (status)
 
@@ -131,10 +132,19 @@ steady-state RSS unchanged.
 **3b (on-disk persisted) — shipped.** The LSP and CLI share the parse cache
 under `<cache_dir>/parse-cache/<root-fingerprint>/`, one namespace per
 mod/workspace or base-game install. Each entry contains a self-contained `.cwb`
-AST and a recovered-parse-error sidecar. Loading interns its strings into the
-current process's `StringTable`.
+AST and a recovered-parse-error sidecar (`.cwe`). Loading interns its strings
+into the current process's `StringTable`.
 
-On Unix, disk-file entries use the path, mtime, size, inode, and ctime, so a
+`<cache_dir>` is the LSP's `cacheDir` initializationOption when the client sends
+one. Otherwise, and always for the CLI, it is `XDG_CACHE_HOME/cwtools`, else
+`%LOCALAPPDATA%\cwtools`, else `~/.cache/cwtools` (`~/Library/Caches/cwtools` on
+macOS), else a temp dir. The base-game index (`.cwv`) lives under the same root.
+The fingerprint covers the game, the workspace root and the cache format
+version. The ruleset is not in it: a `.cwb` entry is a parsed AST and `.cwt`
+rules cannot change how a script file parses, so editing the rules keeps the
+cache warm.
+
+On Unix, disk-file entries use the path, mtime, size, device, inode, and ctime, so a
 warm hit skips reading the source. Other platforms use a content hash after the
 read. The CLI caches both indexing and validation, but still drops the first
 AST set before localisation indexing to keep the large-workspace memory bound.
