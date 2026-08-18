@@ -101,6 +101,66 @@ Every user-visible change gets an entry in the top version section of
 move someone's diagnostics or baselines go under `Notes` prefixed
 `**Behavioral:**`. Write what the reader observes, not what the patch did.
 
+## Releasing
+
+A release is a tag. `.github/workflows/release.yml` fires on `v*`, builds the
+Linux x86_64, macOS arm64 and Windows x86_64 archives, runs the release-profile
+suite alongside them, and publishes the archives plus a `SHA256SUMS` as the
+GitHub release. Nothing else ships the binaries. That tag is the only
+authorization the workflow gets, so most of the process is about making it worth
+trusting.
+
+Cutting X.Y.Z:
+
+1. Rename the top section of `CHANGELOG.md` from `# unreleased` to `# X.Y.Z`.
+   The headings inside a version section are `##`.
+2. Bump `version` under `[workspace.package]` in `cwtools-rs/Cargo.toml`. It is
+   the only place the number lives; all 15 crates inherit it with
+   `version.workspace = true`. Run any cargo command afterwards so `Cargo.lock`
+   picks up the 15 member entries, and stage the lockfile with the manifest.
+   Leaving it behind ships binaries that name the previous release.
+3. Land both through a PR. `main` is protected, and the tag has to point into it.
+4. Tag the merged commit, signed and annotated, and push the tag:
+
+```plaintext
+git tag -s -a vX.Y.Z -m vX.Y.Z
+git push origin vX.Y.Z
+```
+
+The workflow refuses a lightweight tag, and refuses one whose commit is not an
+ancestor of `origin/main`, both before anything builds. That is defense in
+depth. What actually stops a bad tag is the `release-tags` ruleset, which holds
+`refs/tags/v*` to signed tags and restricts creation, update, deletion and
+non-fast-forward. So the tag wants to be signed, not merely annotated, and that
+needs `user.signingkey` set locally with the key registered on the GitHub
+account as a signing key. SSH counts: `gpg.format ssh` with the public key path
+as the signing key.
+
+Nothing is set up to sign on the maintainer's machine today, so the tag goes up
+annotated but unsigned, on the repo-admin bypass, and `git tag -a` is what
+actually gets run. The signature rule stays aspirational until a signing key is
+configured. Worth fixing, since a bypass used every release is not a control.
+
+Dry run before the tag. `gh workflow run release.yml --ref <branch>` builds all
+three platforms and runs the release tests off a branch, and publishing is gated
+on a `refs/tags/` ref, so a branch dispatch cannot ship anything. Dispatching off
+a tag does publish, which is the re-run path; `gh release upload --clobber` makes
+that idempotent.
+
+Rollback is delete, never move. `gh release delete vX.Y.Z --cleanup-tag` takes
+the release and the tag down together, and the next push of that tag is a clean
+run. The same ruleset restricts tag deletion, so that step needs the account
+that can bypass it. Repointing a live tag at a new commit is the thing to avoid:
+anyone who already pulled it keeps the old binaries under the same version
+number. Cut X.Y.Z+1 instead.
+
+Then the downstream one. `cwtools-vscode` bundles this engine as the
+`submodules/cwtools` submodule, and its release refuses an untagged engine
+(`git describe --tags --exact-match`), so the extension cannot ship until that
+pointer sits on a release tag. Dependabot opens the bump PR and
+`automerge-engine.yml` lands it once Test passes, but only forward: a bump to an
+older tag is refused. Check the PR arrived rather than assuming it did.
+
 ## Performance work
 
 Claim an improvement only with before and after numbers taken the same way. A

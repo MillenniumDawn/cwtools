@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  # Push a v* tag to build and publish the release. workflow_dispatch is a
-  # manual fallback for re-runs (off a tag ref it builds but skips publish).
+  # Push a v* tag to build and publish the release. workflow_dispatch is the
+  # manual path: off a branch it builds without publishing, which is the dry
+  # run; off a tag it re-runs the publish, which is idempotent.
   push:
     tags:
       - "v*"

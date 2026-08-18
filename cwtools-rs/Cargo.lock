@@ -357,7 +357,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cwtools_cache"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "cwtools_file_manager",
  "cwtools_parser",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_cli"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_driver"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_cache",
@@ -415,11 +415,11 @@ dependencies = [
 
 [[package]]
 name = "cwtools_error_codes"
-version = "2.5.0"
+version = "2.6.0"
 
 [[package]]
 name = "cwtools_file_manager"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_parser",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_game"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "rustc-hash",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_index"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_cache",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_info"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "cwtools_index",
  "cwtools_parser",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_localization"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_error_codes",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_lsp"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "assert_cmd",
  "cwtools_cache",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_parser"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_string_table",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_profiling"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "libc",
  "tracing",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_rules"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "cwtools_error_codes",
  "cwtools_file_manager",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_string_table"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "parking_lot",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "cwtools_validation"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "criterion",
  "cwtools_error_codes",
