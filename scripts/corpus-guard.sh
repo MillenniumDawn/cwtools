@@ -6,7 +6,10 @@
 #
 # Inputs are two git checkouts, pinned by SHA in the baseline header:
 #
-#   corpus  a real HOI4 mod (Kaiserreich-4-Development)
+#   corpus  a real HOI4 mod. Kaiserreich-4-Development by default;
+#           scripts/md-guard.sh drives this script at Millennium Dawn and a
+#           baseline of its own, so a change has two real mods to move rather
+#           than one, and they do not report the same codes
 #   rules   the .cwt ruleset (cwtools-hoi4-config/Config)
 #
 # The default run has no vanilla game install. --vanilla needs a Steam copy of

@@ -112,12 +112,44 @@ Adding a family to the fixture is the way to keep it honest as more checks go
 behind the base-game gate. Run it alongside the corpus guard for anything that
 touches those six codes.
 
-When a change is *meant* to move diagnostics, re-bless the baseline in the same
-commit and say in the message which codes moved and why:
+### Millennium Dawn tier
+
+One real mod is one mod's worth of coverage, and the two big HOI4 mods do not
+write the same script. The third tier validates
+[Millennium Dawn](https://github.com/MillenniumDawn/Millennium-Dawn) against a
+baseline of its own (`scripts/md-baseline.csv`, 11564 diagnostics as of
+writing):
+
+```sh
+./scripts/md-guard.sh
+```
+
+Same script underneath, same flags, same exit codes, same ruleset. It expects
+`Millennium-Dawn` beside the other checkouts under `CWTOOLS_PROJECTS`, and it
+passes a `--corpus` of its own rather than reading `CWTOOLS_CORPUS`, since an
+exported one is almost always pointing at Kaiserreich and would have this tier
+validate that mod against the wrong baseline. Pass `--corpus` yourself to move
+it.
+
+The overlap between the two corpora is smaller than a second mod sounds like it
+would be. Kaiserreich is the only side reporting CW122, CW248, CW251 and CW280,
+Millennium Dawn the only side reporting CW105, CW255, CW262 and CW268, and the
+codes they share come out in nothing like the same proportions: 4651 CW272 in
+MD against 78 in Kaiserreich, 2725 CW223 in Kaiserreich against 1 in MD. A
+change that moves one baseline and leaves the other alone has usually found
+something. Run both.
+
+Each baseline records its own corpus and rules revisions and is re-blessed on
+its own, so the two rules pins can sit on different commits. CI reads each
+tier's revisions out of the header of the baseline that tier checks against.
+
+When a change is *meant* to move diagnostics, re-bless the baselines it moved
+in the same commit and say in the message which codes moved and why:
 
 ```sh
 ./scripts/corpus-guard.sh --bless
-git add scripts/corpus-baseline.csv
+./scripts/md-guard.sh --bless
+git add scripts/corpus-baseline.csv scripts/md-baseline.csv
 ```
 
 A re-bless that isn't explained in the commit message is indistinguishable from
