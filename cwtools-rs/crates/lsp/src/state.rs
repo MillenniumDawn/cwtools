@@ -238,6 +238,8 @@ pub(crate) struct DocumentState {
     /// files: CW113 resolves a `filepath` against mod and base game as one set,
     /// so the two halves have to land in the same write (#283).
     pub(crate) vanilla_file_paths: Mutex<Option<Vec<String>>>,
+    /// Staged vanilla vars — see `VarIndex::vanilla_names` for provenance semantics.
+    pub(crate) vanilla_var_names: Mutex<Option<Vec<String>>>,
     /// The base-game install's loc keys, hover text and definition sites, read
     /// from disk on the first loc rebuild and reused for the rest of the session
     /// (#89) — vanilla is ~2000 loc files that cannot change while the editor is
@@ -883,6 +885,7 @@ impl DocumentState {
             vanilla_merged_uris: Mutex::new(HashSet::new()),
             vanilla_loc_keys: Mutex::new(None),
             vanilla_file_paths: Mutex::new(None),
+            vanilla_var_names: Mutex::new(None),
             vanilla_loc: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_key_index: parking_lot::RwLock::new(None),

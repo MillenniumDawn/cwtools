@@ -525,3 +525,103 @@ fn command_chain_scripted_loc_typo_warns_when_index_populated() {
         "scripted_loc typo must warn when index populated: {codes:?}"
     );
 }
+
+// ── Issue #306: vanilla variables in loc chains ─────────────────────────────
+fn scoped_loc_codes_with_vanilla(loc: &str, key: &str, vanilla_vars: &[&str]) -> Vec<String> {
+    use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(SCOPED_CWT, &table), &table);
+    let idx = loc_index(&[("a_l_english.yml", loc)]);
+    let mut type_index = cwtools_index::TypeIndex::new();
+    type_index
+        .var_index
+        .set_vanilla_names(vanilla_vars.iter().map(|s| s.to_string()).collect());
+    let script = format!("mytype = {{\n name = {key}\n}}\n");
+    let parsed = parse_string(&script, &table);
+    let registry = build_scope_registry_arc(&ruleset, Some(cwtools_game::constants::Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/mytype/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            type_index: Some(&type_index),
+            modifier_keys: None,
+            loc_index: Some(&idx),
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: true,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+#[test]
+fn chain_reading_vanilla_variable_is_clean() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.vanilla_morale|1]\"\n",
+        "my_key",
+        &["vanilla_morale"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "vanilla var in chain must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_undefined_still_flags_with_other_vanilla() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.mystery_var|1]\"\n",
+        "my_key",
+        &["other_vanilla"],
+    );
+    assert!(
+        codes.contains(&"CW226".to_string()),
+        "undefined var must still flag even with other vanilla present: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_vanilla_case_insensitive_is_clean() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.VANILLA_MORALE|1]\"\n",
+        "my_key",
+        &["vanilla_morale"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "vanilla case-insensitive must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_with_empty_vanilla_is_lenient() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.mystery_var|1]\"\n",
+        "my_key",
+        &[],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "empty var_index gates lenient, must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_vanilla_cross_form_is_clean() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.my_var|1]\"\n",
+        "my_key",
+        &["My_Var@GER"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "vanilla My_Var@GER must resolve as my_var: {codes:?}"
+    );
+}
