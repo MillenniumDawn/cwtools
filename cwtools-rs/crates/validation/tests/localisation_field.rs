@@ -586,3 +586,42 @@ fn chain_reading_undefined_still_flags_with_other_vanilla() {
         "undefined var must still flag even with other vanilla present: {codes:?}"
     );
 }
+
+#[test]
+fn chain_reading_vanilla_case_insensitive_is_clean() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.VANILLA_MORALE|1]\"\n",
+        "my_key",
+        &["vanilla_morale"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "vanilla case-insensitive must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_with_empty_vanilla_is_lenient() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.mystery_var|1]\"\n",
+        "my_key",
+        &[],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "empty var_index gates lenient, must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_vanilla_cross_form_is_clean() {
+    let codes = scoped_loc_codes_with_vanilla(
+        "l_english:\n my_key: \"[?ROOT.my_var|1]\"\n",
+        "my_key",
+        &["My_Var@GER"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "vanilla My_Var@GER must resolve as my_var: {codes:?}"
+    );
+}

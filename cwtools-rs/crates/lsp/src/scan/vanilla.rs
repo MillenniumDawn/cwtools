@@ -219,7 +219,7 @@ impl Backend {
         // mod file that shares a name does not strip the vanilla definition
         // (#306). Installed here rather than during the per-type merge so it
         // does not depend on the type instances being pending.
-        // Clone, not take — must survive across scans like file_paths (see below).
+        // Clone, not take — must survive across scans.
         if let Some(var_names) = self.state.vanilla_var_names.lock().clone() {
             let mut info = self.state.info_service.write();
             info.type_index.var_index.set_vanilla_names(var_names);
@@ -235,7 +235,7 @@ impl Backend {
         // already merged). Case-insensitive: the editor has no equivalent of
         // the CLI's --case-sensitive-files. With no workspace folder there is
         // no mod half and the check stays silent, as does a mod-only run with
-        // no base game. Clone, not take, so the next scan can rebuild again.
+        // no base game. Clone, not take — must survive across scans.
         let workspace_root = match self.state.config.read().workspace_roots.first().cloned() {
             Some(r) => r,
             None => return,
@@ -548,10 +548,9 @@ mod tests {
     }
 
     #[test]
-    fn stage_and_merge_installs_vanilla_vars() {
+    fn stage_does_not_install_before_merge() {
         let backend = test_backend();
         backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_var"]));
-        // Before merge the live var_index is still empty.
         assert!(
             !backend
                 .state
@@ -561,6 +560,12 @@ mod tests {
                 .var_index
                 .contains("vanilla_var")
         );
+    }
+
+    #[test]
+    fn merge_installs_after_stage() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_var"]));
         backend.merge_pending_vanilla_index();
         assert!(
             backend
@@ -706,9 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_vars_are_scoped_by_var_checks_gate() {
-        // The loc field's var check is gated on `!var_index.is_empty()` —
-        // vanilla alone must make the index non-empty so the gate opens.
+    fn vanilla_makes_index_non_empty() {
         let backend = test_backend();
         assert!(
             backend
@@ -730,7 +733,37 @@ mod tests {
                 .var_index
                 .is_empty()
         );
-        // Also verify vanilla_merged prevents re-index but not var install.
+    }
+
+    #[test]
+    fn merge_sets_vanilla_merged_flag() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["vanilla_only"]));
+        backend.merge_pending_vanilla_index();
         assert!(backend.state.vanilla_merged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn vanilla_vars_case_insensitive_via_vanilla_provenance() {
+        let backend = test_backend();
+        backend.stage_vanilla_payload(vanilla_data(vec!["VANILLA_VAR"]));
+        backend.merge_pending_vanilla_index();
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .var_index
+                .contains("vanilla_var")
+        );
+        let names: std::collections::HashSet<String> = backend
+            .state
+            .info_service
+            .read()
+            .type_index
+            .loc_bindable_names()
+            .collect();
+        assert!(names.contains("vanilla_var"));
     }
 }

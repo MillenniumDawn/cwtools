@@ -1272,6 +1272,7 @@ impl Backend {
         }
     }
 
+    /// Clear all in-memory base-game state (staged vanilla + live var_index).
     fn clear_vanilla_state(&self) {
         self.state.vanilla_merged.store(false, Ordering::SeqCst);
         *self.state.vanilla_index.lock() = None;

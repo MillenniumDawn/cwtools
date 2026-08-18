@@ -313,11 +313,11 @@ impl VarIndex {
         self.names.is_empty() && self.vanilla_names.is_empty()
     }
 
-    // distinct union; shared counts once
+    /// Distinct union size; shared names counted once.
     pub fn len(&self) -> usize {
         let mut len = self.names.len();
         for v in &self.vanilla_names {
-            if !self.names.contains_key(v) {
+            if !self.names.contains_key(v.as_str()) {
                 len += 1;
             }
         }
@@ -407,7 +407,7 @@ impl VarIndex {
     }
 
     /// Base-game names staged via [`set_vanilla_names`](Self::set_vanilla_names).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn vanilla_names_iter(&self) -> impl Iterator<Item = &String> {
         self.vanilla_names.iter()
     }
@@ -417,7 +417,7 @@ impl VarIndex {
         self.names.keys().chain(
             self.vanilla_names
                 .iter()
-                .filter(|k| !self.names.contains_key(*k)),
+                .filter(|k| !self.names.contains_key(k.as_str())),
         )
     }
 }
@@ -1397,33 +1397,54 @@ mod tests {
     #[test]
     fn var_index_vanilla_set_makes_contains_true() {
         let mut vi = VarIndex::new();
-        assert!(vi.is_empty());
         vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
         assert!(vi.contains("vanilla_var"));
-        assert!(vi.contains("VANILLA_VAR"), "contains is case-insensitive");
+    }
+
+    #[test]
+    fn var_index_vanilla_set_case_insensitive() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
+        assert!(vi.contains("VANILLA_VAR"));
+    }
+
+    #[test]
+    fn var_index_vanilla_set_is_empty_and_len() {
+        let mut vi = VarIndex::new();
+        assert!(vi.is_empty());
+        vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
         assert!(!vi.is_empty());
         assert_eq!(vi.len(), 1);
     }
 
     #[test]
-    fn var_index_vanilla_normalizes_and_skips_empty() {
+    fn var_index_vanilla_quoted_trim_normalized() {
         let mut vi = VarIndex::new();
-        vi.set_vanilla_names(vec![
-            "\"quoted_var\"".to_string(),
-            "foo.bar^2".to_string(),
-            "my_var?100".to_string(),
-            "my_var@GER".to_string(),
-            "   ".to_string(),
-            "".to_string(),
-        ]);
+        vi.set_vanilla_names(vec!["\"quoted_var\"".to_string()]);
         assert!(vi.contains("quoted_var"));
-        assert!(vi.contains("bar"), "last dot-segment is the key");
-        assert!(vi.contains("my_var"), "? and @ suffixes are stripped");
-        assert_eq!(
-            vi.len(),
-            3,
-            "empty strings must be skipped, dup my_var collapsed"
-        );
+    }
+
+    #[test]
+    fn var_index_vanilla_dot_last_segment() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["foo.bar^2".to_string()]);
+        assert!(vi.contains("bar"));
+    }
+
+    #[test]
+    fn var_index_vanilla_suffix_stripping() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["my_var?100".to_string(), "my_var@GER".to_string()]);
+        assert!(vi.contains("my_var"));
+        assert_eq!(vi.len(), 1, "? and @ suffixes collapse to same key");
+    }
+
+    #[test]
+    fn var_index_vanilla_empty_and_whitespace_skipped() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["   ".to_string(), "".to_string()]);
+        assert!(vi.is_empty());
+        assert_eq!(vi.len(), 0);
     }
 
     #[test]
@@ -1482,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn var_index_vanilla_clear_drops_it() {
+    fn var_index_vanilla_clear_drops_vanilla_retains_mod() {
         let mut vi = VarIndex::new();
         vi.add_name("mod_var");
         vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
@@ -1490,8 +1511,17 @@ mod tests {
         assert!(!vi.contains("vanilla_var"));
         assert!(vi.contains("mod_var"));
         assert!(!vi.is_empty());
+    }
+
+    #[test]
+    fn var_index_vanilla_second_clear_idempotent() {
+        let mut vi = VarIndex::new();
+        vi.add_name("mod_var");
+        vi.set_vanilla_names(vec!["vanilla_var".to_string()]);
         vi.clear_vanilla_names();
-        assert!(vi.contains("mod_var"), "second clear is idempotent");
+        vi.clear_vanilla_names();
+        assert!(vi.contains("mod_var"));
+        assert!(!vi.contains("vanilla_var"));
     }
 
     #[test]
@@ -1520,28 +1550,67 @@ mod tests {
         let mut vi = VarIndex::new();
         vi.add_name("shared");
         vi.set_vanilla_names(vec!["shared".to_string(), "vanilla".to_string()]);
-        let all: HashSet<String> = vi.all_names().cloned().collect();
-        assert_eq!(all.len(), 2);
-        assert!(all.contains("shared"));
-        assert!(all.contains("vanilla"));
+        assert_eq!(vi.all_names().count(), vi.len());
+        assert_eq!(vi.len(), 2);
     }
 
     #[test]
-    fn var_index_add_name_normalizes_compound() {
-        // add_name normalizes the same way as set_vanilla_names, exercising
-        // the thread-local buffer path for mod-defined vars.
+    fn var_index_all_names_count_equals_len_when_shared_cross_form() {
+        let mut vi = VarIndex::new();
+        vi.add_name("SHARED_VAR");
+        vi.set_vanilla_names(vec![
+            "shared_var".to_string(),
+            "My_Var@GER".to_string(),
+            "foo.bar".to_string(),
+        ]);
+        vi.add_name("my_var");
+        vi.add_name("bar");
+        // SHARED_VAR/shared_var and My_Var@GER/my_var and foo.bar/bar all collapse
+        assert_eq!(vi.all_names().count(), vi.len());
+        assert_eq!(vi.len(), 3);
+    }
+
+    #[test]
+    fn vanilla_names_iter_returns_staged() {
+        let mut vi = VarIndex::new();
+        vi.set_vanilla_names(vec!["b".to_string(), "a".to_string()]);
+        let mut v: Vec<_> = vi.vanilla_names_iter().cloned().collect();
+        v.sort();
+        assert_eq!(v, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn var_index_add_name_quoted_stripped() {
         let mut vi = VarIndex::new();
         vi.add_name("\"My_Var\"");
-        assert!(vi.contains("my_var"), "quoted stripped");
+        assert!(vi.contains("my_var"));
+    }
+
+    #[test]
+    fn var_index_add_name_at_suffix_stripped() {
+        let mut vi = VarIndex::new();
         vi.add_name("My_Var@GER");
-        assert!(vi.contains("my_var"), "@ suffix stripped");
+        assert!(vi.contains("my_var"));
+    }
+
+    #[test]
+    fn var_index_add_name_dot_and_selectors_stripped() {
+        let mut vi = VarIndex::new();
         vi.add_name("foo.bar?100");
-        assert!(vi.contains("bar"), "dot + ? selector stripped");
+        assert!(vi.contains("bar"));
         vi.add_name("baz^2");
         assert!(vi.contains("baz"));
-        // My_Var and My_Var@GER collapse to the same key, so 4 adds -> 3 distinct.
-        assert_eq!(vi.len(), 3);
+    }
+
+    #[test]
+    fn var_index_add_name_whitespace_skipped() {
+        let mut vi = VarIndex::new();
+        vi.add_name("\"My_Var\"");
+        vi.add_name("My_Var@GER");
+        vi.add_name("foo.bar?100");
+        // My_Var and My_Var@GER collapse, so 3 adds -> 2 distinct (my_var, bar)
+        assert_eq!(vi.len(), 2);
         vi.add_name("   ");
-        assert_eq!(vi.len(), 3, "empty/whitespace skipped");
+        assert_eq!(vi.len(), 2);
     }
 }
