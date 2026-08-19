@@ -40,7 +40,7 @@ pub struct TypeInstance {
 /// (Linux/Mac). The on-disk case is collected only while `case_sensitive` is
 /// set, so the default run stores nothing extra. Cache-restored paths carry
 /// their on-disk case (the cache stores it), so they are case-checked too.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FileIndex {
     /// Lowercased relative paths; the case-insensitive membership set.
     files: FxHashSet<String>,
@@ -291,7 +291,7 @@ impl FileIndex {
 /// canonical key so a definition like `morale@ROOT` and a read like
 /// `morale@GER` both resolve to `morale`. The CLI fills it during the batch
 /// index; the LSP fills it incrementally as files are indexed.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct VarIndex {
     /// Normalized variable name → how many definitions carry it. A refcount so the
     /// LSP can drop a name on `clear_file` only when its last definition goes,
@@ -460,7 +460,7 @@ impl NameRefs {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
     pub map: FxHashMap<String, Vec<(Arc<str>, TypeInstance)>>,

@@ -32,7 +32,7 @@ type NameValuePair = (Arc<str>, Arc<str>);
 /// `Arc<str>` keys in both maps share the same allocation — each (name, value)
 /// string is allocated once even though it appears in both `by_name` and the
 /// per-file bookkeeping list.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NamedValueIndex {
     by_name: HashMap<Arc<str>, HashMap<Arc<str>, usize>>,
     per_file: HashMap<String, Vec<NameValuePair>>,
