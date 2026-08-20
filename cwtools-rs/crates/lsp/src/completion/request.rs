@@ -103,7 +103,7 @@ impl Backend {
         let overlay_keys = self.loc_overlay_keys();
         let index_guard = self.state.loc_index.read();
         let keys = index_guard
-            .as_ref()
+            .as_deref()
             .map(|index| index.union())
             .into_iter()
             .flat_map(|keys| keys.iter().map(AsRef::as_ref))

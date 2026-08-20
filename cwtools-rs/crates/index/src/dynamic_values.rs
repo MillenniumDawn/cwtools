@@ -32,7 +32,7 @@ type NameValuePair = (Arc<str>, Arc<str>);
 /// `Arc<str>` keys in both maps share the same allocation — each (name, value)
 /// string is allocated once even though it appears in both `by_name` and the
 /// per-file bookkeeping list.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NamedValueIndex {
     by_name: HashMap<Arc<str>, HashMap<Arc<str>, usize>>,
     per_file: HashMap<String, Vec<NameValuePair>>,
@@ -569,5 +569,53 @@ alias[effect:generate_character] = {
         assert!(idx.values("country_flag").any(|v| v == "shared"));
         idx.remove_file("b.txt");
         assert!(idx.values("country_flag").next().is_none());
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut idx = NamedValueIndex::new();
+        idx.merge_file(
+            "a.txt",
+            HashMap::from([("country_flag".to_string(), vec!["a_flag".to_string()])]),
+        );
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.merge_file(
+            "b.txt",
+            HashMap::from([("country_flag".to_string(), vec!["b_flag".to_string()])]),
+        );
+        assert!(!idx.contains("country_flag", "b_flag"));
+        assert!(mutated.contains("country_flag", "b_flag"));
+        assert!(snap.contains("country_flag", "a_flag"));
+        assert!(!snap.contains("country_flag", "b_flag"));
+        // Removing from original must not affect clone.
+        idx.remove_file("a.txt");
+        assert!(!idx.contains("country_flag", "a_flag"));
+        assert!(snap.contains("country_flag", "a_flag"));
+    }
+
+    #[test]
+    fn clone_multi_namespace_is_independent() {
+        let mut idx = NamedValueIndex::new();
+        idx.merge_file(
+            "a.txt",
+            HashMap::from([
+                ("country_flag".to_string(), vec!["a_flag".to_string()]),
+                ("global_flag".to_string(), vec!["g_flag".to_string()]),
+            ]),
+        );
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.merge_file(
+            "b.txt",
+            HashMap::from([("country_flag".to_string(), vec!["b_flag".to_string()])]),
+        );
+        assert!(!idx.contains("country_flag", "b_flag"));
+        assert!(mutated.contains("country_flag", "b_flag"));
+        assert!(snap.contains("global_flag", "g_flag"));
+        // export() must not alias
+        let snap_export = snap.export();
+        let idx_export = idx.export();
+        assert_eq!(snap_export.len(), idx_export.len());
     }
 }

@@ -451,4 +451,27 @@ mod tests {
             "workspace English without commands must not pick up vanilla's"
         );
     }
+
+    #[test]
+    fn clone_snapshot_is_independent() {
+        let idx = LocIndex::build(&service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n a_key: \"hi\"\n",
+        )]));
+        let snap = idx.clone();
+        let other = LocIndex::build(&service_from(&[(
+            "b_l_english.yml",
+            "l_english:\n b_key: \"hi\"\n",
+        )]));
+        let mut mutated = snap.clone();
+        mutated.merge_from(&other, None);
+        assert!(mutated.exists_any("b_key"));
+        assert!(
+            !snap.exists_any("b_key"),
+            "snapshot must not see merged key"
+        );
+        assert!(!idx.exists_any("b_key"), "original must not see merged key");
+        assert!(snap.exists_any("a_key"));
+        // original remove not in test; clone independence for merge is the snapshot invariant workspace.rs:760 relies on
+    }
 }

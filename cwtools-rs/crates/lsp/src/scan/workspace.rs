@@ -26,6 +26,10 @@ use super::{
     spawn_logging_panics, stat_signature_for,
 };
 
+/// ~one rayon work unit; 256 balances per-chunk rayon parallelism vs UI
+/// cancel/progress yield cadence on a 7k-file corpus.
+const PASS2_CHUNK_SIZE: usize = 256;
+
 impl Backend {
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
     /// status-bar loading indicator on return, regardless of which internal path
@@ -760,41 +764,54 @@ impl Backend {
             Option<u64>,
             InlineIgnoreMap,
         );
-        // Same sampler/latch pair as pass 1. Pass 2 additionally holds the
-        // index and loc read guards for its whole parallel section — it must
-        // see one consistent snapshot — which is the other reason progress
-        // can't be reported from inside it directly.
+        // Snapshot indexes under brief read guards so rayon holds no
+        // `info_service`/`loc_index` locks; a keystroke needing `write()` no
+        // longer blocks for the whole pass (pointer-swap shape, yield between
+        // chunks for cancel/progress on large mods). Clone is O(instances) but
+        // holds the read guard only for the deep copy (~ms vs seconds).
+        let type_index_snap = self.state.info_service.read().type_index.clone();
+        let loc_index_snap = self.state.loc_index.read().clone();
+        // Parallel vectors built lock-step in the index phase; chunks().zip()
+        // truncates to shortest on mismatch — fail-fast so a length
+        // invariant bug surfaces instead of silently dropping diagnostics.
+        assert_eq!(scan_files.len(), parsed_files.len());
+        assert_eq!(scan_files.len(), source_hashes.len());
+        assert_eq!(scan_files.len(), inline_ignores.len());
         let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
-        let results: Vec<(String, Vec<Diagnostic>, Option<u64>, InlineIgnoreMap)> = {
-            let info_guard = self.state.info_service.read();
-            let loc_guard = self.state.loc_index.read();
-            let type_index = &info_guard.type_index;
-            let loc_index = loc_guard.as_ref();
-            let registry = scan_registry.as_ref();
-            // One Prepared for the whole batch (None if the ruleset isn't loaded).
-            // It is Copy + all-borrows, so it is shared freely across rayon threads.
-            let prepared = scan_ruleset.as_ref().map(|ruleset| {
-                make_prepared(
-                    ruleset,
-                    &self.state.string_table,
-                    scan_game,
-                    type_index,
-                    &modifier_keys_snap,
-                    loc_index,
-                    // Full scan skips open docs, so the unsaved-key overlay is
-                    // irrelevant here.
-                    None,
-                    registry,
-                    scope_checks,
-                    var_checks,
-                )
-            });
-
-            let mut results: Vec<ValidationOutcome> = scan_files
+        let registry = scan_registry.as_ref();
+        let prepared = scan_ruleset.as_ref().map(|ruleset| {
+            make_prepared(
+                ruleset,
+                &self.state.string_table,
+                scan_game,
+                &type_index_snap,
+                &modifier_keys_snap,
+                loc_index_snap.as_deref(),
+                None,
+                registry,
+                scope_checks,
+                var_checks,
+            )
+        });
+        let mut chunked_results: Vec<ValidationOutcome> = Vec::with_capacity(scan_files.len());
+        for ((files_chunk, parsed_chunk), (hashes_chunk, ignores_chunk)) in scan_files
+            .chunks(PASS2_CHUNK_SIZE)
+            .zip(parsed_files.chunks(PASS2_CHUNK_SIZE))
+            .zip(
+                source_hashes
+                    .chunks(PASS2_CHUNK_SIZE)
+                    .zip(inline_ignores.chunks(PASS2_CHUNK_SIZE)),
+            )
+        {
+            if cancel.is_cancelled() {
+                validate_ticker.stop();
+                return false;
+            }
+            let chunk_results: Vec<ValidationOutcome> = files_chunk
                 .par_iter()
-                .zip(parsed_files.par_iter())
-                .zip(source_hashes.par_iter())
-                .zip(inline_ignores.par_iter())
+                .zip(parsed_chunk.par_iter())
+                .zip(hashes_chunk.par_iter())
+                .zip(ignores_chunk.par_iter())
                 .filter_map(|(((file, parsed_opt), source_hash), inline_ignored)| {
                     if cancel.is_cancelled() {
                         return None;
@@ -806,10 +823,9 @@ impl Backend {
                     if open_uris.contains(&file.uri) {
                         return None;
                     }
-                    // Workspace scan covers files not open in an editor (open
-                    // ones are skipped above), so their text isn't held: no line
-                    // info, and the cheap single-char range at the parser's own
-                    // column. did_open republishes the precise range.
+                    // Workspace scan covers files not open in an editor, so
+                    // no line info — cheap single-char range at parser column;
+                    // did_open republishes the precise range.
                     let no_lines = DocLines::none();
                     let (diagnostics, used) = match &prepared {
                         Some(prepared) => validate_parsed_with_indexes(
@@ -833,88 +849,74 @@ impl Backend {
                     ))
                 })
                 .collect();
-
-            // Skipped on cancel: this rebuilds the `type_uses` store from
-            // `results`, and a cancelled pass 2 filled only part of it. Letting
-            // it run would prune every unscanned file's recorded uses and then
-            // report their definitions as unused (CW239/CW231) — diagnostics
-            // invented by the cancellation itself.
-            if track_uses
-                && !cancel.is_cancelled()
-                && let Some(prepared) = &prepared
-            {
-                // Open docs whose uses aren't recorded yet (opened before the
-                // rules loaded, so their validates couldn't track): compute
-                // from the cached AST. The rest carry their stored entry
-                // forward — it was refreshed by their last validate, so it is
-                // never staler than the buffer.
-                let unrecorded: Vec<(String, Arc<cwtools_parser::ast::ParsedFile>)> = {
-                    let store = self.state.type_uses.read();
-                    open_doc_asts
-                        .iter()
-                        .filter(|(u, _)| !store.contains_key(u))
-                        .cloned()
-                        .collect()
-                };
-                let open_uses: Vec<(String, UsedInstances)> = unrecorded
-                    .par_iter()
-                    .map(|(u, ast)| {
-                        let (_, used) = validate_prepared_tracking_uses(ast, u, prepared);
-                        (u.clone(), used)
-                    })
-                    .collect();
-
-                // Rebuild the store from this scan: fresh entries for every
-                // scanned file, the carried/computed ones for open docs, and
-                // nothing else — which is what prunes files deleted since the
-                // last scan.
-                let merged = {
-                    let mut store = self.state.type_uses.write();
-                    store.retain(|uri, _| open_uris.contains(uri));
-                    for (uri, _, used, _, _) in &mut results {
-                        store.insert(uri.clone(), used.take().unwrap_or_default());
-                    }
-                    for (uri, used) in open_uses {
-                        store.insert(uri, used);
-                    }
-                    let mut merged = UsedInstances::default();
-                    for uses in store.values() {
-                        merged.merge_from(uses);
-                    }
-                    merged
-                };
-                self.state
-                    .type_uses_revision
-                    .fetch_add(1, Ordering::Release);
-
-                // Phase 2 of the batch shape: with every file's uses merged,
-                // flag each scanned file's own definitions nothing referenced.
-                // Open docs get the same check from the post-scan
-                // `revalidate_all_open_docs`, which reads the store just built.
-                let no_lines = DocLines::none();
-                for (uri, diagnostics, _, _, _) in &mut results {
-                    let file: cwtools_validation::FilePath = uri.as_str().into();
-                    for err in check_unused_instances(
-                        prepared.ruleset,
-                        scan_game,
-                        &type_index.instances_in_file(uri),
-                        &merged,
-                        &file,
-                    ) {
-                        diagnostics.push(validation_error_to_diagnostic(&err, &no_lines));
-                    }
+            chunked_results.extend(chunk_results);
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                validate_ticker.stop();
+                return false;
+            }
+        }
+        let mut results: Vec<ValidationOutcome> = chunked_results;
+        // Unused-instance second phase: same global merge as before, but against
+        // the snapshot's `type_index_snap` so it doesn't re-acquire the lock.
+        // Skipped on cancel: a partial `results` would prune unscanned files.
+        if track_uses
+            && !cancel.is_cancelled()
+            && let Some(prepared) = &prepared
+        {
+            let unrecorded: Vec<(String, Arc<cwtools_parser::ast::ParsedFile>)> = {
+                let store = self.state.type_uses.read();
+                open_doc_asts
+                    .iter()
+                    .filter(|(u, _)| !store.contains_key(u))
+                    .cloned()
+                    .collect()
+            };
+            let open_uses: Vec<(String, UsedInstances)> = unrecorded
+                .par_iter()
+                .map(|(u, ast)| {
+                    let (_, used) = validate_prepared_tracking_uses(ast, u, prepared);
+                    (u.clone(), used)
+                })
+                .collect();
+            let merged = {
+                let mut store = self.state.type_uses.write();
+                store.retain(|uri, _| open_uris.contains(uri));
+                for (uri, _, used, _, _) in &mut results {
+                    store.insert(uri.clone(), used.take().unwrap_or_default());
+                }
+                for (uri, used) in open_uses {
+                    store.insert(uri, used);
+                }
+                let mut merged = UsedInstances::default();
+                for uses in store.values() {
+                    merged.merge_from(uses);
+                }
+                merged
+            };
+            self.state
+                .type_uses_revision
+                .fetch_add(1, Ordering::Release);
+            let no_lines = DocLines::none();
+            for (uri, diagnostics, _, _, _) in &mut results {
+                let file: cwtools_validation::FilePath = uri.as_str().into();
+                for err in check_unused_instances(
+                    prepared.ruleset,
+                    scan_game,
+                    &type_index_snap.instances_in_file(uri),
+                    &merged,
+                    &file,
+                ) {
+                    diagnostics.push(validation_error_to_diagnostic(&err, &no_lines));
                 }
             }
-
-            results
-                .into_iter()
-                .map(|(uri, diagnostics, _, source_hash, inline_ignored)| {
-                    (uri, diagnostics, source_hash, inline_ignored)
-                })
-                .collect()
-            // info_guard / loc_guard dropped here, before any await.
-        };
-
+        }
+        let results: Vec<(String, Vec<Diagnostic>, Option<u64>, InlineIgnoreMap)> = results
+            .into_iter()
+            .map(|(uri, diagnostics, _, source_hash, inline_ignored)| {
+                (uri, diagnostics, source_hash, inline_ignored)
+            })
+            .collect();
         validate_ticker.stop();
         if cancel.is_cancelled() {
             return false;
@@ -1010,7 +1012,7 @@ impl Backend {
                 .state
                 .loc_index
                 .read()
-                .as_ref()
+                .as_deref()
                 .map(|i| i.union().len())
                 .unwrap_or(0);
             tracing::info!(target: "cwtools::profile", "{}", info_summary);

@@ -20,7 +20,7 @@ use super::{
 
 impl Backend {
     pub(crate) fn is_known_loc_key(&self, lower: &str) -> bool {
-        if let Some(idx) = self.state.loc_index.read().as_ref()
+        if let Some(idx) = self.state.loc_index.read().as_deref()
             && idx.union().contains(lower)
         {
             return true;
