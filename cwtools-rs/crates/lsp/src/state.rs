@@ -251,7 +251,9 @@ pub(crate) struct DocumentState {
         Mutex<Option<(crate::scan::VanillaLocKey, Arc<crate::scan::VanillaLoc>)>>,
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
-    pub(crate) loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
+    /// `Arc` so snapshot clone is a pointer bump, not a deep copy of the union
+    /// (485f0b). `loc_key_index` already uses `Arc` for the same reason.
+    pub(crate) loc_index: parking_lot::RwLock<Option<Arc<cwtools_localization::LocIndex>>>,
     /// Sorted, prefix-searchable mirror of `loc_index`'s key union, built beside
     /// it on each scan so loc completion can binary-search for the typed token
     /// instead of sweeping all ~400K keys per keystroke. `None` until the first

@@ -4,6 +4,10 @@
 
 - The server speaks Arabic, French, German, Italian, Spanish, Simplified Chinese and Traditional Chinese. It reads the display language from the `locale` the client sends in `initialize` (`initializationOptions.locale` also works for a client that sends neither), and answers in it: the 64 diagnostic messages that carry English text of their own, the scan progress and status-bar phases, the `reloadrulesconfig` / `clearAllCaches` / `reindexWorkspace` result toasts, the ten code-action titles, and the hover's `Scope` / `Resolves to` / `Required scopes` / `Localisation` / `Description` labels. A code or key a language has not translated falls back to English rather than showing a placeholder, and nothing sets a locale in the CLI, so batch runs, SARIF and the corpus baselines stay English. Paradox script keywords are left alone throughout: `NOT`/`NOR`/`AND`, `ROOT`/`PREV`/`FROM`, `set_name`, `l_language.yml`, `mean_time_to_happen` and the `CWxxx` codes all read the same in every language. (MillenniumDawn/cwtools-vscode#118)
 
+## Improvements
+
+- LSP: workspace scan pass 2 no longer holds the index locks across the whole validation. It snapshots the type and loc indexes under brief read guards and validates in 256-file chunks with yields, so a keystroke that needs `info_service.write()` no longer blocks for the full scan. (#288)
+
 ## Bug Fixes
 
 - `cwtools validate` no longer changes its diagnostics when the same mod sits on a different filesystem. Loc discovery and `.cwt` loading sort each directory, and a loc key's command-validation representative is the English entry when English exists, even if that string has no `[command]`s. A Brazilian `[Grécia]` (or any other language's commands) can no longer turn a valid `desc = EUevent.5.d` into CW267. (#313)

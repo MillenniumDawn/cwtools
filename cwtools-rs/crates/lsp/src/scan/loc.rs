@@ -312,7 +312,7 @@ impl Backend {
                 loc_index.union().iter().map(AsRef::as_ref),
             ))
         });
-        *self.state.loc_index.write() = Some(loc_index);
+        *self.state.loc_index.write() = Some(Arc::new(loc_index));
         *self.state.loc_key_index.write() = Some(loc_key_index);
         *self.state.loc_text.write() = loc_text_map;
         *self.state.loc_locations.write() = loc_loc_map;
