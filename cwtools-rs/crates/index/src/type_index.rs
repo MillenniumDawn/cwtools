@@ -509,7 +509,11 @@ pub struct TypeIndex {
     /// e.g. `equipment_stat`, `country_tags`, `idea_name`. Completion-only.
     pub complex_enum_values: dynamic_values::NamedValueIndex,
     /// `value_set[...]` members collected from indexed files (namespace ->
-    /// values), e.g. `country_flag`, `global_flag`. Completion-only.
+    /// values), e.g. `country_flag`, `global_flag`. Feeds completion, and also
+    /// validation: a `from_data` scope link with `data_source = value[<set>]`
+    /// makes any member of that set a scope-opening key, so dropping this from
+    /// an index the rule engine reads moves diagnostics
+    /// (`validation::rule_core::matching::is_from_data_value_set_member`).
     pub value_set_values: dynamic_values::NamedValueIndex,
 }
 
@@ -1690,5 +1694,56 @@ mod tests {
         idx.remove_file("file://a.txt");
         assert!(!idx.contains("event", "ev_a"));
         assert!(snap2.contains("event", "ev_a"));
+    }
+
+    /// Workspace scan pass 2 validates against a *clone* of the live index, and
+    /// the rule engine reads `value_set_values` for `from_data` scope links. A
+    /// clone that dropped the dynamic-value indexes would leave every unit test
+    /// green (they build their index directly) while silently moving scan
+    /// diagnostics, which is the trap #332's "keep them out of the snapshot"
+    /// plan sets. Pin that the snapshot still answers membership.
+    #[test]
+    fn clone_carries_dynamic_value_indexes() {
+        let mut idx = TypeIndex::new();
+        idx.value_set_values.merge_file(
+            "file://a.txt",
+            HashMap::from([("character_token".to_string(), vec!["tok_a".to_string()])]),
+        );
+        idx.complex_enum_values.merge_file(
+            "file://a.txt",
+            HashMap::from([(
+                "equipment_stat".to_string(),
+                vec!["build_cost_ic".to_string()],
+            )]),
+        );
+        let snap = idx.clone();
+        assert!(snap.value_set_values.contains("character_token", "tok_a"));
+        assert!(
+            snap.complex_enum_values
+                .contains("equipment_stat", "build_cost_ic")
+        );
+    }
+
+    #[test]
+    fn clone_dynamic_value_indexes_are_independent() {
+        let mut idx = TypeIndex::new();
+        idx.value_set_values.merge_file(
+            "file://a.txt",
+            HashMap::from([("character_token".to_string(), vec!["tok_a".to_string()])]),
+        );
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.value_set_values.merge_file(
+            "file://b.txt",
+            HashMap::from([("character_token".to_string(), vec!["tok_b".to_string()])]),
+        );
+        assert!(!idx.value_set_values.contains("character_token", "tok_b"));
+        assert!(
+            mutated
+                .value_set_values
+                .contains("character_token", "tok_b")
+        );
+        idx.value_set_values.remove_file("file://a.txt");
+        assert!(snap.value_set_values.contains("character_token", "tok_a"));
     }
 }

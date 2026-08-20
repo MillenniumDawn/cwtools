@@ -768,7 +768,11 @@ impl Backend {
         // `info_service`/`loc_index` locks; a keystroke needing `write()` no
         // longer blocks for the whole pass (pointer-swap shape, yield between
         // chunks for cancel/progress on large mods). Clone is O(instances) but
-        // holds the read guard only for the deep copy (~ms vs seconds).
+        // holds the read guard only for the deep copy (~ms vs seconds): 41ms on
+        // Millennium Dawn's 249k instances, per `cargo bench -p cwtools_driver
+        // --bench snapshot_clone`. Nearly all of that is the type maps, so
+        // keeping the dynamic-value indexes out of the snapshot would save
+        // about 7% and is not the lever (#332).
         let type_index_snap = self.state.info_service.read().type_index.clone();
         let loc_index_snap = self.state.loc_index.read().clone();
         // Parallel vectors built lock-step in the index phase; chunks().zip()

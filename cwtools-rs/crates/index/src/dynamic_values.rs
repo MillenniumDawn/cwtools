@@ -7,9 +7,11 @@
 //!   * `value_set[...]` members — flags/tokens written by effects
 //!     (`set_country_flag = my_flag` defines a `country_flag`).
 //!
-//! Both feed completion (and hover) only. Validation keeps its lenient
-//! behavior for absent/large enums and uncollected sets, so collecting these
-//! changes no diagnostics.
+//! Complex-enum members feed completion (and hover) only: validation keeps its
+//! lenient behavior for absent/large enums, so collecting them changes no
+//! diagnostics. Value-set members feed completion the same way, but the rule
+//! engine reads them too, for `from_data` scope links whose `data_source` is
+//! `value[<set>]` (see `TypeIndex::value_set_values`).
 
 use crate::{dec_ref, unquote};
 use std::collections::HashMap;
