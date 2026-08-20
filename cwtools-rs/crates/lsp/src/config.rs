@@ -1336,10 +1336,14 @@ impl Backend {
         *self.state.vanilla_loc_keys.lock() = None;
         *self.state.vanilla_file_paths.lock() = None;
         *self.state.vanilla_var_names.lock() = None;
+        *self.state.vanilla_scripted_loc_names.lock() = None;
         *self.state.vanilla_loc.lock() = None;
         {
             let mut info = self.state.info_service.write();
             info.type_index.var_index.clear_vanilla_names();
+            info.type_index
+                .scripted_loc_index
+                .set_vanilla_names(Vec::new());
         }
         self.bump_info_revision();
     }

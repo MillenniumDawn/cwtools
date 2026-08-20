@@ -519,6 +519,9 @@ mod tests {
 
     /// The registry is the gate: `cwtools loc` without `--rules` has none, and
     /// an unknown command has to stay lenient there rather than be invented.
+    /// The scripted-localisation registry is the second gate (#348) — without it
+    /// a tail could be a `defined_text` — so this supplies an empty one, meaning
+    /// "the project defines none", not "nothing is known".
     #[test]
     fn the_project_command_pass_needs_a_registry() {
         let svc = service_from(&[(
@@ -533,6 +536,7 @@ mod tests {
         let data = LocScopeData {
             game: Some(cwtools_game::constants::Game::Hoi4),
             registry: Some(std::sync::Arc::new(ScopeRegistry::default())),
+            scripted_locs: Some(&|_: &str| false),
             ..Default::default()
         };
         let diags = validate_loc_project_commands(&svc, None, &data);
@@ -894,7 +898,7 @@ mod tests {
             question_mark_variable: true,
             parameter_variables: true,
             scripted_variables: Some(&is_known_var),
-            ..Default::default()
+            scripted_locs: Some(&|_: &str| false),
         };
         // Build a service with many entries so rayon actually parallelizes.
         let mut files = Vec::new();

@@ -485,6 +485,7 @@ impl Session {
             HashMap<String, Vec<cwtools_index::TypeInstance>>,
             Vec<String>,
             HashMap<String, Vec<String>>,
+            Vec<String>,
         );
         let var_effects = variable_defining_effects(&ruleset);
         let per_file: Vec<PerFileResult> = parsed
@@ -512,17 +513,27 @@ impl Session {
                     &src.parsed,
                     &rules_table,
                 );
+                // Scripted-localisation names, so a loc command naming one is not
+                // reported as an unknown command (#348). Path-driven: the HOI4
+                // ruleset's `scripted_loc` type points at Stellaris's folder, so
+                // the type index never sees them.
+                let scripted_locs = cwtools_index::collect_scripted_loc_names(
+                    &src.parsed,
+                    &src.logical_path,
+                    &rules_table,
+                );
                 (
                     collected.instances,
                     collected.subtype_instances,
                     var_names,
                     value_sets,
+                    scripted_locs,
                 )
             })
             .collect();
 
         let mut type_index = TypeIndex::new();
-        for (src, (instances, subtype_instances, var_names, value_sets)) in
+        for (src, (instances, subtype_instances, var_names, value_sets, scripted_locs)) in
             parsed.iter().zip(per_file)
         {
             let file_uri = src.path.to_str().unwrap_or("");
@@ -534,6 +545,9 @@ impl Session {
                 type_index.var_index.add_name(n);
             }
             type_index.value_set_values.merge_file(file_uri, value_sets);
+            type_index
+                .scripted_loc_index
+                .merge_file(file_uri, scripted_locs);
         }
         let source_files: Vec<SourceFile> = parsed
             .into_iter()
@@ -600,6 +614,9 @@ impl Session {
                 "<vanilla-cache>",
                 aux.value_set_values.into_iter().collect(),
             );
+            type_index
+                .scripted_loc_index
+                .set_vanilla_names(aux.scripted_loc_names);
             cached_loc_keys = Some(aux.loc_keys);
         } else if let Some(vanilla_dir) = &vanilla {
             let vanilla_index = if let Some(parse_cache_dir) = &vanilla_parse_cache_dir
@@ -635,6 +652,13 @@ impl Session {
                 }
             }
             type_index.var_index.merge(&vanilla_index.var_index);
+            type_index.scripted_loc_index.set_vanilla_names(
+                vanilla_index
+                    .scripted_loc_index
+                    .names()
+                    .map(str::to_string)
+                    .collect(),
+            );
             for (type_name, entries) in vanilla_index.map {
                 let per_type = HashMap::from([(
                     type_name,
@@ -1211,6 +1235,11 @@ pub fn build_vanilla_cache_aux(
         var_names: index.var_index.names().cloned().collect(),
         complex_enum_values: index.complex_enum_values.export(),
         value_set_values: index.value_set_values.export(),
+        scripted_loc_names: index
+            .scripted_loc_index
+            .names()
+            .map(str::to_string)
+            .collect(),
     }
 }
 

@@ -422,6 +422,83 @@ impl VarIndex {
     }
 }
 
+/// Scripted-localisation names (`defined_text = { name = X }`) read straight off
+/// the files in a scripted-loc folder, not through a ruleset type.
+///
+/// The loc-command check needs to tell a scripted localisation apart from a
+/// typo, and asking the ruleset for it does not work: the HOI4 config declares
+/// `type[scripted_loc]` at Stellaris's `game/common/scripted_loc`, so nothing
+/// under HOI4's `common/scripted_localisation` is ever typed and every use of
+/// one read as an unknown command (#348). The engine already fixes that folder
+/// name elsewhere (`cwtools_validation::initial_scope_context`), so collecting
+/// by path here keeps the two agreeing.
+///
+/// Names are stored lowercased; Paradox identifiers are case-insensitive.
+/// Refcounted per file so the LSP's re-index of one file refreshes its names
+/// instead of leaking the old set, same as [`VarIndex`].
+#[derive(Debug, Clone, Default)]
+pub struct ScriptedLocIndex {
+    names: FxHashMap<Arc<str>, usize>,
+    per_file: FxHashMap<Arc<str>, Vec<Arc<str>>>,
+    /// Base-game names staged from the vanilla cache or a live walk. Kept apart
+    /// from `names` so a `remove_file` on a mod file sharing a name does not
+    /// strip the base-game definition (same split as [`VarIndex`]).
+    vanilla_names: FxHashSet<Arc<str>>,
+}
+
+impl ScriptedLocIndex {
+    /// Replace `file_uri`'s contribution with `names`.
+    pub fn merge_file(&mut self, file_uri: &str, names: Vec<String>) {
+        self.remove_file(file_uri);
+        if names.is_empty() {
+            return;
+        }
+        let mut flat: Vec<Arc<str>> = Vec::with_capacity(names.len());
+        for name in names {
+            let key: Arc<str> = Arc::from(name.to_ascii_lowercase().as_str());
+            *self.names.entry(Arc::clone(&key)).or_insert(0) += 1;
+            flat.push(key);
+        }
+        self.per_file.insert(Arc::from(file_uri), flat);
+    }
+
+    /// Drop `file_uri`'s contribution (refcounted).
+    pub fn remove_file(&mut self, file_uri: &str) {
+        let Some(flat) = self.per_file.remove(file_uri) else {
+            return;
+        };
+        for name in flat {
+            dec_ref(&mut self.names, name.as_ref());
+        }
+    }
+
+    /// Replace the base-game contribution with `names`. A re-merge drops the
+    /// previous set rather than accumulating.
+    pub fn set_vanilla_names(&mut self, names: Vec<String>) {
+        self.vanilla_names = names
+            .into_iter()
+            .filter(|n| !n.is_empty())
+            .map(|n| Arc::from(n.to_ascii_lowercase().as_str()))
+            .collect();
+    }
+
+    /// Whether any scripted localisation is known. `true` means the check has no
+    /// data and must stay lenient rather than call every command a typo.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.vanilla_names.is_empty()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.names.contains_key(lower.as_str()) || self.vanilla_names.contains(lower.as_str())
+    }
+
+    /// The workspace names, for persisting to the vanilla cache.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.keys().map(Arc::as_ref)
+    }
+}
+
 /// How many definitions of one instance name a type holds, split by where they
 /// came from. `total` answers "does this name exist" (`contains`); `workspace`
 /// answers "did the project define it more than once" (CW261), which a
@@ -500,6 +577,10 @@ pub struct TypeIndex {
     /// reference checks (CW246). The CLI fills it during the batch index;
     /// the LSP fills it incrementally via `InfoService`.
     pub var_index: VarIndex,
+    /// Project-wide set of scripted-localisation names, for the loc-command
+    /// checks (CW226/CW266). Filled by path rather than by ruleset type; see
+    /// [`ScriptedLocIndex`].
+    pub scripted_loc_index: ScriptedLocIndex,
     /// Whether this index includes vanilla (base-game) definitions. When
     /// `false`, CW500 type-reference checks are skipped to avoid false
     /// positives on valid vanilla cross-references. The driver sets this
@@ -827,6 +908,7 @@ impl TypeIndex {
     pub fn remove_file(&mut self, file_uri: &str) {
         self.complex_enum_values.remove_file(file_uri);
         self.value_set_values.remove_file(file_uri);
+        self.scripted_loc_index.remove_file(file_uri);
         // No entry means the file contributed no type instances.
         let Some(type_positions) = self.file_positions.remove(file_uri) else {
             return;
@@ -1393,6 +1475,87 @@ mod tests {
                 "ku_move_007.wav"
             ),
             "a genuinely-missing sibling must not resolve"
+        );
+    }
+
+    // ── ScriptedLocIndex (#348) ───────────────────────────────────────────────
+
+    fn scripted_loc_index_with(file: &str, names: &[&str]) -> ScriptedLocIndex {
+        let mut idx = ScriptedLocIndex::default();
+        idx.merge_file(file, names.iter().map(|s| s.to_string()).collect());
+        idx
+    }
+
+    #[test]
+    fn scripted_loc_lookup_is_case_insensitive() {
+        let idx = scripted_loc_index_with("a.txt", &["AST_GetNavyName"]);
+        assert!(idx.contains("ast_getnavyname"));
+        assert!(idx.contains("AST_GETNAVYNAME"));
+        assert!(!idx.contains("AST_Typo"));
+    }
+
+    #[test]
+    fn scripted_loc_empty_until_a_name_lands() {
+        let mut idx = ScriptedLocIndex::default();
+        assert!(idx.is_empty(), "no names means the check has no data");
+        idx.merge_file("a.txt", vec!["Foo".into()]);
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn scripted_loc_remove_file_drops_only_that_files_names() {
+        let mut idx = scripted_loc_index_with("a.txt", &["Shared", "OnlyA"]);
+        idx.merge_file("b.txt", vec!["Shared".into()]);
+        idx.remove_file("a.txt");
+        assert!(!idx.contains("OnlyA"), "a.txt's own name goes");
+        assert!(idx.contains("Shared"), "b.txt still defines it");
+        idx.remove_file("b.txt");
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn scripted_loc_reindex_replaces_a_files_names() {
+        let mut idx = scripted_loc_index_with("a.txt", &["Old"]);
+        idx.merge_file("a.txt", vec!["New".into()]);
+        assert!(!idx.contains("Old"), "the previous set must not leak");
+        assert!(idx.contains("New"));
+    }
+
+    #[test]
+    fn scripted_loc_vanilla_survives_a_mod_file_clear() {
+        let mut idx = scripted_loc_index_with("a.txt", &["Shared"]);
+        idx.set_vanilla_names(vec!["Shared".into(), "VanillaOnly".into()]);
+        idx.remove_file("a.txt");
+        assert!(idx.contains("Shared"), "the base-game definition stays");
+        assert!(idx.contains("VanillaOnly"));
+    }
+
+    #[test]
+    fn scripted_loc_vanilla_remerge_replaces_not_accumulates() {
+        let mut idx = ScriptedLocIndex::default();
+        idx.set_vanilla_names(vec!["First".into()]);
+        idx.set_vanilla_names(vec!["Second".into()]);
+        assert!(!idx.contains("First"));
+        assert!(idx.contains("Second"));
+    }
+
+    #[test]
+    fn scripted_loc_names_are_the_workspace_half_only() {
+        let mut idx = scripted_loc_index_with("a.txt", &["ModOne"]);
+        idx.set_vanilla_names(vec!["VanillaOne".into()]);
+        let names: Vec<&str> = idx.names().collect();
+        assert_eq!(names, vec!["modone"], "the cache stores vanilla separately");
+    }
+
+    #[test]
+    fn type_index_remove_file_drops_scripted_locs() {
+        let mut idx = TypeIndex::new();
+        idx.scripted_loc_index
+            .merge_file("a.txt", vec!["Foo".into()]);
+        idx.remove_file("a.txt");
+        assert!(
+            !idx.scripted_loc_index.contains("Foo"),
+            "the LSP's clear_file path routes through remove_file"
         );
     }
 
