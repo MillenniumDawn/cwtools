@@ -84,7 +84,7 @@ pub(crate) fn alias_overloads_with_confidence<'a>(
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
     let mut overloads: Overloads<'a> = SmallVec::new();
-    if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
+    if let Some(idxs) = ruleset.alias_exact().get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
             push_overload(
                 &mut overloads,
@@ -101,7 +101,7 @@ pub(crate) fn alias_overloads_with_confidence<'a>(
     if overloads.is_empty() && key.bytes().any(|b| b.is_ascii_uppercase()) {
         let lower = key.to_ascii_lowercase();
         if let Some(idxs) = ruleset
-            .alias_exact
+            .alias_exact()
             .get(category)
             .and_then(|m| m.get(lower.as_str()))
         {
@@ -115,7 +115,7 @@ pub(crate) fn alias_overloads_with_confidence<'a>(
             }
         }
     }
-    if let Some(cat) = ruleset.alias_categories.get(category) {
+    if let Some(cat) = ruleset.alias_categories().get(category) {
         for pat in &cat.parsed_patterns {
             // Classify once: a `Confident` match is included in both sets, a
             // `PermissiveOnly` match only in the permissive (all) set.

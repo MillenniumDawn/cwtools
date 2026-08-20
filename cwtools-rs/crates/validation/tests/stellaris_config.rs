@@ -191,18 +191,18 @@ fn config_pretriggers_populate_per_scope() {
     ] {
         assert!(
             ruleset
-                .pretriggers
+                .pretriggers()
                 .get(scope)
                 .is_some_and(|set| set.contains(member)),
             "expected pretriggers[{scope}] to contain `{member}`, got: {:?}",
-            ruleset.pretriggers.keys().collect::<Vec<_>>()
+            ruleset.pretriggers().keys().collect::<Vec<_>>()
         );
     }
 
     // The map is per-scope, not a flat union: `is_idle` is leader-only.
     assert!(
         !ruleset
-            .pretriggers
+            .pretriggers()
             .get("planet")
             .is_some_and(|set| set.contains("is_idle")),
         "leader-only pretrigger must not leak into the planet set"

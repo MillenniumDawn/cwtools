@@ -107,8 +107,8 @@ pub(crate) struct TypeRefRule {
 /// leaf key (rule keys match case-insensitively).
 pub(crate) fn build_type_ref_keys(ruleset: &RuleSet) -> HashMap<String, Vec<TypeRefRule>> {
     let mut map: HashMap<String, Vec<TypeRefRule>> = HashMap::new();
-    if !ruleset.type_reference_rules.is_empty() {
-        for (key, entries) in &ruleset.type_reference_rules {
+    if !ruleset.type_reference_rules().is_empty() {
+        for (key, entries) in ruleset.type_reference_rules() {
             map.insert(
                 key.clone(),
                 entries
@@ -178,7 +178,7 @@ pub(crate) fn classify_type_ref_key(
         let ok = match &e.root_type {
             None => true,
             Some(rt) => ruleset
-                .type_by_name
+                .type_by_name()
                 .get(rt.as_ref())
                 .map(|&idx| check_path_dir(&ruleset.types[idx].path_options, logical_path))
                 .unwrap_or(false),

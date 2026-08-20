@@ -314,7 +314,7 @@ pub(crate) fn enum_contains(
     enum_name: &str,
     value: &str,
 ) -> bool {
-    match ruleset.enum_by_name.get(enum_name) {
+    match ruleset.enum_by_name().get(enum_name) {
         Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
             // Enum membership is case-insensitive (F# lowercases both the enum
             // values and the checked key — FieldValidators.fs `getLowerKey` +

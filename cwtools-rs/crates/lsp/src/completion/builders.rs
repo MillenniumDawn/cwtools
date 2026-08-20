@@ -344,7 +344,7 @@ pub(crate) fn completions_from_rules(
                 // (#76). The resolution machinery already backs goto/hover.
                 if !scope_links_emitted
                     && ruleset
-                        .alias_categories
+                        .alias_categories()
                         .get(cat)
                         .is_some_and(|c| c.scope_field_idx.is_some())
                 {
@@ -571,7 +571,7 @@ enum TypeInstanceStyle {
 /// `None` when `t` isn't dotted or doesn't resolve to a real type/subtype pair.
 fn find_subtype<'a>(ruleset: &'a RuleSet, t: &str) -> Option<&'a SubTypeDefinition> {
     let (base, sub) = t.split_once('.')?;
-    let &i = ruleset.type_by_name.get(base)?;
+    let &i = ruleset.type_by_name().get(base)?;
     ruleset.types[i].subtypes.iter().find(|st| st.name == sub)
 }
 
@@ -780,7 +780,7 @@ fn push_alias_keys(
     // emit one KEYWORD item per instance of the referenced type. Composite patterns
     // like `production_speed_<building>_factor` (non-empty prefix/suffix) are too
     // complex to expand here and are skipped.
-    if let Some(cat_idx) = ruleset.alias_categories.get(cat) {
+    if let Some(cat_idx) = ruleset.alias_categories().get(cat) {
         for pattern in &cat_idx.parsed_patterns {
             if !pattern.prefix.is_empty() || !pattern.suffix.is_empty() {
                 continue;
@@ -996,7 +996,7 @@ fn push_scope_link_keys(
 /// to any alias (the ruleset reloaded since the item was built) or none of
 /// its overloads carry a description.
 pub(crate) fn alias_documentation(ruleset: &RuleSet, cat: &str, name: &str) -> Option<String> {
-    let indices = ruleset.alias_exact.get(cat)?.get(name)?;
+    let indices = ruleset.alias_exact().get(cat)?.get(name)?;
     indices
         .iter()
         .find_map(|&i| ruleset.aliases[i].1.1.description.clone())
@@ -1009,7 +1009,7 @@ pub(crate) fn alias_documentation(ruleset: &RuleSet, cat: &str, name: &str) -> O
 /// preview of the value resolve will fetch later.
 fn alias_has_description(ruleset: &RuleSet, cat: &str, name: &str) -> bool {
     ruleset
-        .alias_exact
+        .alias_exact()
         .get(cat)
         .and_then(|m| m.get(name))
         .is_some_and(|indices| {
@@ -1046,7 +1046,7 @@ fn push_bool_leaf_values(items: &mut Vec<CompletionItem>) {
 }
 
 pub(crate) fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> &'a [String] {
-    if let Some(&idx) = ruleset.enum_by_name.get(enum_name) {
+    if let Some(&idx) = ruleset.enum_by_name().get(enum_name) {
         return &ruleset.enums[idx].values;
     }
     &[]

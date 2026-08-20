@@ -264,9 +264,9 @@ fn is_defined(
     name: &str,
 ) -> bool {
     match kind {
-        RefKind::Type => ruleset.type_by_name.contains_key(name),
+        RefKind::Type => ruleset.type_by_name().contains_key(name),
         RefKind::Enum => {
-            ruleset.enum_by_name.contains_key(name)
+            ruleset.enum_by_name().contains_key(name)
                 || ruleset.complex_enums.iter().any(|c| c.name == name)
         }
         RefKind::SingleAlias => single_alias_names.contains(name),

@@ -54,30 +54,30 @@ pub struct RuleSet {
     /// Lookup index over `aliases`, built by `reindex()`. Two-level map:
     /// `category → key → indices of every matching overload`. Lookups require
     /// only two borrowed-str probes with zero allocation on the hot path.
-    pub alias_exact: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, Vec<usize>>>,
+    alias_exact: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, Vec<usize>>>,
     /// Per-category alias metadata (the `<type>` patterns and `scope_field`),
     /// also built by `reindex()`.
-    pub alias_categories: rustc_hash::FxHashMap<String, AliasCategoryIndex>,
+    alias_categories: rustc_hash::FxHashMap<String, AliasCategoryIndex>,
     /// Lookup index over `types`, built by `reindex()`. Maps a type name to its
     /// index in `types`, so name lookups are O(1) instead of a linear scan.
-    pub type_by_name: rustc_hash::FxHashMap<String, usize>,
+    type_by_name: rustc_hash::FxHashMap<String, usize>,
     /// Lookup index over `enums`, built by `reindex()`. Maps an enum key to its
     /// index in `enums` for O(1) lookups.
-    pub enum_by_name: rustc_hash::FxHashMap<String, usize>,
+    enum_by_name: rustc_hash::FxHashMap<String, usize>,
     /// Lookup index over `root_rules`, built by `reindex()`. Maps a type-rule
     /// name to its index in `root_rules`, so `find_rules_by_name` is O(1)
     /// instead of a linear scan per root child.
-    pub type_rules_idx: rustc_hash::FxHashMap<String, usize>,
+    type_rules_idx: rustc_hash::FxHashMap<String, usize>,
     /// Built by `reindex()`: lowercased leaf key -> each depth-one `<type>`
     /// reference rule. Shared by workspace reference indexing and open-document
     /// reference scans so neither rescans every root rule per candidate leaf.
-    pub type_reference_rules: rustc_hash::FxHashMap<String, Vec<TypeReferenceRule>>,
+    type_reference_rules: rustc_hash::FxHashMap<String, Vec<TypeReferenceRule>>,
     /// Built by `reindex()`: lowercased effect/trigger alias key -> the
     /// `value_set[...]` namespace its body declares (e.g. `set_country_flag` ->
     /// `country_flag`). Used to collect dynamically-defined set members (flags,
     /// tokens, …) for completion. Aliases declaring multiple namespaces keep
     /// the first found.
-    pub value_set_effects: rustc_hash::FxHashMap<String, String>,
+    value_set_effects: rustc_hash::FxHashMap<String, String>,
     /// Built by `reindex()`: lowercased effect/trigger alias key -> the
     /// `(binding_field_key, namespace)` pairs declared by a NESTED field in its
     /// block body (e.g. `generate_character` -> `[("token_base", "character_token")]`,
@@ -85,27 +85,27 @@ pub struct RuleSet {
     /// collector capture the value of the exact field bound to `value_set[ns]`
     /// instead of guessing from a fixed key list, so members under non-obvious keys
     /// (`token_base`, `id`, `legacy_id`, `array`, …) are still collected.
-    pub value_set_effect_fields: rustc_hash::FxHashMap<String, Vec<(String, String)>>,
+    value_set_effect_fields: rustc_hash::FxHashMap<String, Vec<(String, String)>>,
     /// Built by `reindex()`, parallel to `enums`: each enum's values lowercased
     /// into a set for O(1) case-insensitive membership (matches the
     /// `eq_ignore_ascii_case` scans in the validator). Empty until reindex.
-    pub enum_values_lower: Vec<rustc_hash::FxHashSet<String>>,
+    enum_values_lower: Vec<rustc_hash::FxHashSet<String>>,
     /// Built by `reindex()`, parallel to `enums`: whether the enum has any
     /// `@`-prefixed scripted-constant member. Empty until reindex.
-    pub enum_has_at: Vec<bool>,
+    enum_has_at: Vec<bool>,
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
-    pub value_sets: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
+    value_sets: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
     /// Built by `reindex()`: the lowercased base names (before any `@` scope
     /// suffix) of `values["variable"]` — the config's built-in variable reads
     /// (`faction_leader`, `party_popularity@<ideology>`, …). Lets
     /// [`Self::is_builtin_variable_base`] answer a CW246 candidate in O(1)
     /// instead of scanning the list (~480 entries for HOI4) per checked read.
     /// Empty until reindex.
-    pub builtin_variable_bases: rustc_hash::FxHashSet<String>,
+    builtin_variable_bases: rustc_hash::FxHashSet<String>,
     /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
     /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
-    pub pretriggers: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
+    pretriggers: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
     /// Source position of every `type[x]` / `enum[x]` / `complex_enum[x]` /
     /// `single_alias[x]` definition, filled by the directory loader for `.cwt`
     /// goto/hover. Empty for hand-built rulesets.
@@ -570,6 +570,133 @@ impl RuleSet {
             buf.extend(base.chars().map(|c| c.to_ascii_lowercase()));
             self.builtin_variable_bases.contains(buf.as_str())
         })
+    }
+
+    fn assert_reindexed(&self) {
+        debug_assert!(
+            self.types.len() == self.type_by_name.len()
+                && self.enums.len() == self.enum_by_name.len()
+                && (self.aliases.is_empty()
+                    || !self.alias_exact.is_empty()
+                    || self.alias_categories.is_empty())
+                && self.enums.len() == self.enum_values_lower.len()
+                && self.enums.len() == self.enum_has_at.len(),
+            "RuleSet used without reindex: derived indexes are stale"
+        );
+    }
+
+    pub fn alias_exact(
+        &self,
+    ) -> &rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, Vec<usize>>> {
+        self.assert_reindexed();
+        &self.alias_exact
+    }
+
+    pub fn alias_categories(&self) -> &rustc_hash::FxHashMap<String, AliasCategoryIndex> {
+        self.assert_reindexed();
+        &self.alias_categories
+    }
+
+    pub fn type_by_name(&self) -> &rustc_hash::FxHashMap<String, usize> {
+        self.assert_reindexed();
+        &self.type_by_name
+    }
+
+    pub fn enum_by_name(&self) -> &rustc_hash::FxHashMap<String, usize> {
+        self.assert_reindexed();
+        &self.enum_by_name
+    }
+
+    pub fn type_rules_idx(&self) -> &rustc_hash::FxHashMap<String, usize> {
+        self.assert_reindexed();
+        &self.type_rules_idx
+    }
+
+    pub fn type_reference_rules(&self) -> &rustc_hash::FxHashMap<String, Vec<TypeReferenceRule>> {
+        self.assert_reindexed();
+        &self.type_reference_rules
+    }
+
+    pub fn value_set_effects(&self) -> &rustc_hash::FxHashMap<String, String> {
+        self.assert_reindexed();
+        &self.value_set_effects
+    }
+
+    pub fn value_set_effect_fields(&self) -> &rustc_hash::FxHashMap<String, Vec<(String, String)>> {
+        self.assert_reindexed();
+        &self.value_set_effect_fields
+    }
+
+    pub fn enum_values_lower(&self) -> &[rustc_hash::FxHashSet<String>] {
+        self.assert_reindexed();
+        &self.enum_values_lower
+    }
+
+    pub fn enum_has_at(&self) -> &[bool] {
+        self.assert_reindexed();
+        &self.enum_has_at
+    }
+
+    pub fn value_sets(&self) -> &rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>> {
+        self.assert_reindexed();
+        &self.value_sets
+    }
+
+    pub fn builtin_variable_bases(&self) -> &rustc_hash::FxHashSet<String> {
+        self.assert_reindexed();
+        &self.builtin_variable_bases
+    }
+
+    pub fn pretriggers(&self) -> &rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>> {
+        self.assert_reindexed();
+        &self.pretriggers
+    }
+
+    pub fn alias_exact_for(&self, category: &str, key: &str) -> Option<&[usize]> {
+        self.assert_reindexed();
+        self.alias_exact
+            .get(category)
+            .and_then(|m| m.get(key))
+            .map(|v| v.as_slice())
+    }
+
+    pub fn alias_category(&self, category: &str) -> Option<&AliasCategoryIndex> {
+        self.assert_reindexed();
+        self.alias_categories.get(category)
+    }
+}
+
+/// Builder that makes a stale index unrepresentable: mutate freely, then
+/// `finish()` reindexes exactly once and returns the ready `RuleSet`.
+#[derive(Debug, Default)]
+pub struct RuleSetBuilder {
+    inner: RuleSet,
+}
+
+impl RuleSetBuilder {
+    pub fn new() -> Self {
+        Self {
+            inner: RuleSet::new(),
+        }
+    }
+
+    pub fn from_ruleset(ruleset: RuleSet) -> Self {
+        Self { inner: ruleset }
+    }
+
+    pub fn ruleset_mut(&mut self) -> &mut RuleSet {
+        &mut self.inner
+    }
+
+    pub fn finish(mut self) -> RuleSet {
+        self.inner.reindex();
+        self.inner
+    }
+}
+
+impl From<RuleSet> for RuleSetBuilder {
+    fn from(rs: RuleSet) -> Self {
+        Self::from_ruleset(rs)
     }
 }
 

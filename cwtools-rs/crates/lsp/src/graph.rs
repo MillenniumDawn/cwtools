@@ -602,7 +602,7 @@ impl Backend {
             let rules = self.state.rules.read();
             match rules.ruleset.as_ref() {
                 Some(rs) => {
-                    let idx = rs.type_by_name.get(&requested_type).copied().or_else(|| {
+                    let idx = rs.type_by_name().get(&requested_type).copied().or_else(|| {
                         rs.types
                             .iter()
                             .position(|t| t.name.eq_ignore_ascii_case(&requested_type))
@@ -721,7 +721,7 @@ impl Backend {
             if let Some(k) = info.type_index.primary_loc_key(&node.entity_type, &node.id) {
                 keys.push(k.to_ascii_lowercase());
             }
-            if let Some(&i) = ruleset.type_by_name.get(&node.entity_type) {
+            if let Some(&i) = ruleset.type_by_name().get(&node.entity_type) {
                 for loc in &ruleset.types[i].localisation {
                     if loc.explicit_field.is_none() && (loc.primary || loc.required) {
                         keys.push(loc.derived_key(&node.id).to_ascii_lowercase());

@@ -242,7 +242,7 @@ fn event_pretriggers<'a>(
 ) -> Option<&'a rustc_hash::FxHashSet<String>> {
     let scope = event_key.strip_suffix("_event")?;
     let scope = if scope == "pop_group" { "pop" } else { scope };
-    ruleset.pretriggers.get(scope)
+    ruleset.pretriggers().get(scope)
 }
 
 /// Validate a Stellaris event body for pretrigger placement (CW120).
@@ -317,7 +317,7 @@ fn validate_pop_job(
     file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some(pretriggers) = ruleset.pretriggers.get("pop") else {
+    let Some(pretriggers) = ruleset.pretriggers().get("pop") else {
         return;
     };
     for child in children {
@@ -678,6 +678,7 @@ mod tests {
     use super::*;
     use cwtools_index::{SourceLocation, TypeInstance};
     use cwtools_parser::parser::parse_string;
+    use cwtools_rules::rules_types::{NewField, Options, RuleType, ValueType};
 
     const EVENTS: &str = "events/test.txt";
     const TECH: &str = "common/technology/test.txt";
@@ -691,13 +692,25 @@ mod tests {
     /// Build a RuleSet's pretrigger map from `(scope, names)` pairs, mirroring
     /// what `reindex()` produces from the config's `alias[<scope>_pre_trigger:<name>]`.
     fn ruleset_with_pretriggers(categories: &[(&str, &[&str])]) -> RuleSet {
+        // Build via aliases so reindex populates the derived pretriggers map
+        // rather than mutating the private derived index directly.
         let mut rs = RuleSet::new();
         for (scope, names) in categories {
-            let set = rs.pretriggers.entry((*scope).to_string()).or_default();
             for name in *names {
-                set.insert((*name).to_string());
+                let alias_name = format!("{scope}_pre_trigger:{name}");
+                rs.aliases.push((
+                    alias_name,
+                    (
+                        RuleType::LeafRule {
+                            left: NewField::SpecificField(name.to_string()),
+                            right: NewField::ValueField(ValueType::Bool),
+                        },
+                        Options::default(),
+                    ),
+                ));
             }
         }
+        rs.reindex();
         rs
     }
 

@@ -160,7 +160,7 @@ impl Backend {
         let mut md = match kind {
             CwtDefKind::Type => {
                 let mut s = format!("**type** `{}`", name);
-                if let Some(&idx) = rs.type_by_name.get(&name) {
+                if let Some(&idx) = rs.type_by_name().get(&name) {
                     let paths = rs.types[idx].path_options.paths.join(", ");
                     if !paths.is_empty() {
                         s.push_str(&format!("\n\npath: {}", paths));
@@ -170,7 +170,7 @@ impl Backend {
             }
             CwtDefKind::Enum => {
                 let mut s = format!("**enum** `{}`", name);
-                if let Some(&idx) = rs.enum_by_name.get(&name) {
+                if let Some(&idx) = rs.enum_by_name().get(&name) {
                     let values = &rs.enums[idx].values;
                     let shown = values.iter().take(5).cloned().collect::<Vec<_>>();
                     let more = if values.len() > 5 { ", …" } else { "" };
@@ -269,7 +269,7 @@ fn display_type_name(
         return type_name.to_string();
     };
     let display = ruleset.and_then(|rs| {
-        let &i = rs.type_by_name.get(base)?;
+        let &i = rs.type_by_name().get(base)?;
         rs.types[i]
             .subtypes
             .iter()
@@ -488,7 +488,7 @@ pub(crate) fn append_type_localisation(
         keys.push(k.to_ascii_lowercase());
     }
     // Name-derived primary/required keys from the type's localisation config.
-    if let Some(&i) = ruleset.type_by_name.get(type_name) {
+    if let Some(&i) = ruleset.type_by_name().get(type_name) {
         for loc in &ruleset.types[i].localisation {
             if loc.explicit_field.is_none() && (loc.primary || loc.required) {
                 keys.push(loc.derived_key(value).to_ascii_lowercase());

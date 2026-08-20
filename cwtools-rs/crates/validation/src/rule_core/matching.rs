@@ -220,7 +220,7 @@ pub(super) fn classify_pattern_match(
                 PatternMatch::No
             }
         }
-        PatternKind::Enum => match ruleset.enum_by_name.get(name) {
+        PatternKind::Enum => match ruleset.enum_by_name().get(name) {
             Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
                 if ruleset.enum_values_contains_ci(idx, middle)
                     || ruleset.enum_has_at_constant(idx)
@@ -265,7 +265,7 @@ pub(crate) fn field_matches_key(
             // reference (`trigger:<scripted_trigger>`, `modifier:..<building>..`),
             // or `scope_field` (any scope-switching key).
             if ruleset
-                .alias_exact
+                .alias_exact()
                 .get(category.as_str())
                 .is_some_and(|m| m.contains_key(key))
             {
@@ -277,14 +277,14 @@ pub(crate) fn field_matches_key(
             if key.bytes().any(|b| b.is_ascii_uppercase()) {
                 let lower = key.to_ascii_lowercase();
                 if ruleset
-                    .alias_exact
+                    .alias_exact()
                     .get(category.as_str())
                     .is_some_and(|m| m.contains_key(lower.as_str()))
                 {
                     return true;
                 }
             }
-            match ruleset.alias_categories.get(category.as_str()) {
+            match ruleset.alias_categories().get(category.as_str()) {
                 // Category has no aliases at all — be permissive (avoid floods).
                 None => true,
                 Some(cat) => {
@@ -311,7 +311,7 @@ pub(crate) fn field_matches_key(
         // Mirrors `enum_contains` from common.rs: case-insensitive, permissive on
         // absent/empty enums, permissive when any member is an @-constant.
         NewField::ValueField(ValueType::Enum(enum_name)) => {
-            match ruleset.enum_by_name.get(enum_name.as_str()) {
+            match ruleset.enum_by_name().get(enum_name.as_str()) {
                 Some(&idx) => {
                     let def = &ruleset.enums[idx];
                     if def.values.is_empty() {
