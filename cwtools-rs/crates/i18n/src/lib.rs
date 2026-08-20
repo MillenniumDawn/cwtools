@@ -174,6 +174,7 @@ keys![
     CommandWorkspaceReindexed => "command.workspaceReindexed", "Workspace re-indexed.";
     CommandReindexInProgress => "command.reindexInProgress", "Re-index already in progress.";
     CommandReindexCancelled => "command.reindexCancelled", "Re-index cancelled.";
+    CommandValidateWorkspace => "command.validateWorkspace", "Workspace validated.";
 
     // The second half of the two composed messages above.
     StatusRevalidated => "status.revalidated", "workspace re-validated";

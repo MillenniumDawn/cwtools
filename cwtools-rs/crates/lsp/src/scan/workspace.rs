@@ -22,7 +22,7 @@ use crate::validate::{
 };
 
 use super::{
-    OpenDocSnapshot, ScanGuard, ScannedFile, hold_scan_for_tests, quiet_pass_can_skip,
+    OpenDocSnapshot, ScanGuard, ScanSummary, ScannedFile, hold_scan_for_tests, quiet_pass_can_skip,
     spawn_logging_panics, stat_signature_for,
 };
 
@@ -33,6 +33,24 @@ use super::{
 const PASS2_CHUNK_SIZE: usize = 256;
 #[cfg(test)]
 const PASS2_CHUNK_SIZE: usize = 2;
+
+/// Maximum number of closed workspace files the scan publishes diagnostics
+/// for in one pass. Above this, new closed-file diagnostics are held back and
+/// only files that already have published diagnostics are cleared, so a
+/// 10k-file mod cannot flood the client with per-file notifications. Open
+/// documents are unaffected.
+#[cfg(not(test))]
+const WORKSPACE_DIAGNOSTICS_BUDGET: usize = 2_000;
+#[cfg(test)]
+const WORKSPACE_DIAGNOSTICS_BUDGET: usize = 2;
+
+/// Maximum number of previously-published closed files the scan clears in one
+/// pass. Capping this prevents a settings toggle or a mass deletion from
+/// flooding the client with empty `publishDiagnostics` notifications.
+#[cfg(not(test))]
+const WORKSPACE_DIAGNOSTICS_CLEAR_BUDGET: usize = 2_000;
+#[cfg(test)]
+const WORKSPACE_DIAGNOSTICS_CLEAR_BUDGET: usize = 2;
 
 /// Map four lock-step slices in parallel, `chunk` elements at a time, yielding
 /// to the runtime between chunks so a long scan stays cancellable and the
@@ -803,6 +821,10 @@ impl Backend {
             .await;
         }
         let mut total_errors = 0usize;
+        let mut total_warnings = 0usize;
+        let mut total_infos = 0usize;
+        let mut total_hints = 0usize;
+        let mut files_with_errors = 0usize;
         let total_files = scan_files.len();
         // Build the scope registry + enum_map ONCE for the whole scan instead of
         // once per file: they depend only on (ruleset, game) and are the
@@ -1029,6 +1051,20 @@ impl Backend {
             return false;
         }
         let publish_total = results.len();
+
+        // Snapshot the publish policy once: the loop is async and config may
+        // change mid-pass, but a single scan won't chase live toggles.
+        let workspace_wide = {
+            let cfg = self.state.config.read();
+            cfg.workspace_wide_diagnostics
+        };
+        let mut closed_budget_remaining = if workspace_wide {
+            WORKSPACE_DIAGNOSTICS_BUDGET
+        } else {
+            0
+        };
+        let mut published_this_scan = std::collections::HashSet::with_capacity(publish_total);
+
         for (i, (uri, mut diagnostics, source_hash, inline_ignored)) in
             results.into_iter().enumerate()
         {
@@ -1036,16 +1072,58 @@ impl Backend {
             // the publish so both see the same set the editor's Problems panel
             // gets.
             crate::validate::drop_inline_suppressed(&mut diagnostics, &inline_ignored);
-            total_errors += diagnostics
-                .iter()
-                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-                .count();
 
-            if let Ok(uri_obj) = Url::parse(&uri) {
-                self.publish_filtered(uri_obj, diagnostics, None, source_hash)
-                    .await;
+            // Update summary counts from the full validation result, whether or
+            // not this file's diagnostics are published this pass.
+            let mut file_has_error = false;
+            for d in &diagnostics {
+                match d.severity {
+                    Some(DiagnosticSeverity::ERROR) => {
+                        total_errors += 1;
+                        file_has_error = true;
+                    }
+                    Some(DiagnosticSeverity::WARNING) => total_warnings += 1,
+                    Some(DiagnosticSeverity::INFORMATION) => total_infos += 1,
+                    Some(DiagnosticSeverity::HINT) => total_hints += 1,
+                    _ => {}
+                }
             }
+            if file_has_error {
+                files_with_errors += 1;
+            }
+
+            let is_open = open_uris.contains(&uri);
+            if !is_open {
+                let previously_published =
+                    { self.state.published_workspace_uris.lock().contains(&uri) };
+                let publish_diagnostics = closed_budget_remaining > 0;
+                if publish_diagnostics {
+                    closed_budget_remaining -= 1;
+                    if let Ok(uri_obj) = Url::parse(&uri) {
+                        self.publish_filtered(uri_obj, diagnostics, None, source_hash)
+                            .await;
+                    }
+                    self.state
+                        .published_workspace_uris
+                        .lock()
+                        .insert(uri.clone());
+                    published_this_scan.insert(uri);
+                } else if previously_published {
+                    // Setting disabled or budget exhausted: clear stale
+                    // diagnostics for files we published before, but leave files
+                    // that were never published untouched.
+                    if let Ok(uri_obj) = Url::parse(&uri) {
+                        self.publish_filtered(uri_obj, Vec::new(), None, source_hash)
+                            .await;
+                    }
+                    // Not re-inserted; the post-loop cleanup removes it.
+                }
+            }
+
             if i % 50 == 49 {
+                // Throttle the notification stream slightly so a large workspace
+                // does not saturate the client with publishDiagnostics traffic.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 tokio::task::yield_now().await;
                 // Publishing is serial and async, so unlike the rayon passes it
                 // reports for itself rather than through a sampler.
@@ -1063,6 +1141,64 @@ impl Backend {
                 }
             }
         }
+
+        // Clear any closed-file URIs that were published previously but are no
+        // longer part of this scan (deleted, ignored, or renamed). The clear
+        // budget prevents a settings toggle or a mass deletion from flooding the
+        // client with empty notifications.
+        let mut clear_budget_remaining = WORKSPACE_DIAGNOSTICS_CLEAR_BUDGET;
+        let stale_uris: Vec<String> = {
+            let set = self.state.published_workspace_uris.lock();
+            set.iter()
+                .filter(|u| !published_this_scan.contains(u.as_str()))
+                .cloned()
+                .collect()
+        };
+        let held_back_clears = stale_uris.len().saturating_sub(clear_budget_remaining);
+        for uri in stale_uris {
+            if clear_budget_remaining == 0 {
+                break;
+            }
+            clear_budget_remaining -= 1;
+            self.state.published_workspace_uris.lock().remove(&uri);
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.publish_filtered(uri_obj, Vec::new(), None, None).await;
+            }
+        }
+
+        // Record the summary of this completed pass.
+        *self.state.last_scan_summary.lock() = Some(ScanSummary {
+            total_files,
+            validated_files: publish_total,
+            files_with_errors,
+            total_errors,
+            total_warnings,
+            total_infos,
+            total_hints,
+        });
+
+        if workspace_wide
+            && closed_budget_remaining == 0
+            && publish_total > WORKSPACE_DIAGNOSTICS_BUDGET
+        {
+            let held_back = publish_total.saturating_sub(WORKSPACE_DIAGNOSTICS_BUDGET);
+            tracing::info!(
+                held_back,
+                clear_held_back = held_back_clears,
+                budget = WORKSPACE_DIAGNOSTICS_BUDGET,
+                "workspace diagnostics budget exhausted; held back closed-file notifications"
+            );
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Workspace diagnostics budget reached: {} files published, {} held back ({} stale clears deferred).",
+                        WORKSPACE_DIAGNOSTICS_BUDGET, held_back, held_back_clears
+                    ),
+                )
+                .await;
+        }
+
         // Pass 2 is done. Drop the per-file ASTs before the file-list / profile
         // summary so the RSS we report reflects the steady-state working set
         // (loc index + type index + open documents), not the in-flight
@@ -1602,6 +1738,113 @@ mod tests {
         )
         .await;
         assert_eq!(out, None);
+    }
+
+    fn setup_error_workspace(n: usize) -> (Backend, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let things = tmp.path().join("common/things");
+        std::fs::create_dir_all(&things).unwrap();
+        for i in 0..n {
+            // A missing closing brace gives a parse error diagnostic for every
+            // file, so we can exercise the budget and summary without needing
+            // a full ruleset.
+            std::fs::write(things.join(format!("{i}.txt")), "thing = {\n").unwrap();
+        }
+        let ws_uri = Url::from_file_path(tmp.path()).unwrap();
+        let backend = test_backend();
+        {
+            let mut cfg = backend.state.config.write();
+            cfg.workspace_uri = Some(ws_uri.as_str().into());
+            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(ws_uri.as_str()));
+        }
+        (backend, tmp)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_summary_counts_errors_and_files() {
+        let (backend, _tmp) = setup_error_workspace(3);
+        let progress =
+            CommandProgress::for_tests(backend.state.clone(), Arc::new(AtomicBool::new(false)));
+        let outcome = backend
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        assert_eq!(outcome, ScanOutcome::Ran);
+        let summary_guard = backend.state.last_scan_summary.lock();
+        let summary = summary_guard
+            .as_ref()
+            .expect("a completed scan must store a summary");
+        assert_eq!(
+            summary.total_files, 3,
+            "summary must count all workspace files"
+        );
+        assert_eq!(
+            summary.validated_files, 3,
+            "validated files must equal the result set"
+        );
+        assert_eq!(
+            summary.files_with_errors, 3,
+            "every malformed file must carry an error"
+        );
+        assert!(
+            summary.total_errors > 0,
+            "summary must record positive error count"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_workspace_diagnostics_disabled_clears_previous() {
+        let (backend, _tmp) = setup_error_workspace(2);
+        let progress =
+            CommandProgress::for_tests(backend.state.clone(), Arc::new(AtomicBool::new(false)));
+        let outcome = backend
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        assert_eq!(outcome, ScanOutcome::Ran);
+        assert_eq!(
+            backend.state.published_workspace_uris.lock().len(),
+            2,
+            "closed files should be published when workspace-wide is on"
+        );
+
+        // Turn off closed-file diagnostics and re-scan. The previous publishes
+        // must be cleared and no new closed files added.
+        backend.state.config.write().workspace_wide_diagnostics = false;
+        let progress2 =
+            CommandProgress::for_tests(backend.state.clone(), Arc::new(AtomicBool::new(false)));
+        let outcome2 = backend
+            .validate_entire_workspace_tracked(false, Some(&progress2))
+            .await;
+        assert_eq!(outcome2, ScanOutcome::Ran);
+        assert!(
+            backend.state.published_workspace_uris.lock().is_empty(),
+            "disabled workspace-wide diagnostics must clear closed-file publishes"
+        );
+        let summary_guard = backend.state.last_scan_summary.lock();
+        let summary = summary_guard
+            .as_ref()
+            .expect("summary is still captured when publishing is disabled");
+        assert!(
+            summary.total_errors > 0,
+            "summary must still count errors even when they are not published"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_workspace_diagnostics_budget_caps_closed_files() {
+        // The test build lowers WORKSPACE_DIAGNOSTICS_BUDGET to 2.
+        let (backend, _tmp) = setup_error_workspace(4);
+        let progress =
+            CommandProgress::for_tests(backend.state.clone(), Arc::new(AtomicBool::new(false)));
+        let outcome = backend
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        assert_eq!(outcome, ScanOutcome::Ran);
+        let published = backend.state.published_workspace_uris.lock();
+        assert_eq!(
+            published.len(),
+            WORKSPACE_DIAGNOSTICS_BUDGET,
+            "only the budgeted number of closed files should be published"
+        );
     }
 
     /// Slices out of lock-step must fail loudly. `chunks().zip()` truncates to
