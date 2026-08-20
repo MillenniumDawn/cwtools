@@ -772,11 +772,11 @@ impl Backend {
         let type_index_snap = self.state.info_service.read().type_index.clone();
         let loc_index_snap = self.state.loc_index.read().clone();
         // Parallel vectors built lock-step in the index phase; chunks().zip()
-        // truncates to shortest on mismatch — fail-fast in debug so a length
+        // truncates to shortest on mismatch — fail-fast so a length
         // invariant bug surfaces instead of silently dropping diagnostics.
-        debug_assert_eq!(scan_files.len(), parsed_files.len());
-        debug_assert_eq!(scan_files.len(), source_hashes.len());
-        debug_assert_eq!(scan_files.len(), inline_ignores.len());
+        assert_eq!(scan_files.len(), parsed_files.len());
+        assert_eq!(scan_files.len(), source_hashes.len());
+        assert_eq!(scan_files.len(), inline_ignores.len());
         let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
         let registry = scan_registry.as_ref();
         let prepared = scan_ruleset.as_ref().map(|ruleset| {
