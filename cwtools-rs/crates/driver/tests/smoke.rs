@@ -1644,6 +1644,114 @@ fn scoped_loc_load_still_validates_unrecognised_headers() {
     );
 }
 
+/// Discovery order is a contract: the TypeIndex merge order is observable
+/// (goto-def first match, duplicate counts), so a silent reorder is a
+/// behavioral change. Single-mod walks are sorted within each directory and
+/// multi-mod deduplication sorts globally by logical_path (#339).
+#[test]
+fn discover_workspace_files_returns_sorted_order_single_mod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    for name in ["zebra.txt", "middle.txt", "alpha.txt"] {
+        std::fs::write(root.join("common").join(name), "x = 1\n").unwrap();
+    }
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&root, Some(&rs));
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert_eq!(
+        logical,
+        vec![
+            "common/alpha.txt".to_string(),
+            "common/middle.txt".to_string(),
+            "common/zebra.txt".to_string()
+        ],
+        "single-mod discovery must be sorted: {logical:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_returns_sorted_order_multi_mod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    std::fs::write(ws.join("mod/a.mod"), "name = \"A Mod\"\npath = \"alpha\"\n").unwrap();
+    std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
+    for p in ["common/zebra.txt", "common/middle.txt", "common/alpha.txt"] {
+        for m in ["alpha", "bravo"] {
+            let path = ws.join(m).join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x = 1\n").unwrap();
+        }
+    }
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&ws, Some(&rs));
+    let files = discover_workspace_files(cfg).expect("multi-mod discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert_eq!(
+        logical,
+        vec![
+            "common/alpha.txt".to_string(),
+            "common/middle.txt".to_string(),
+            "common/zebra.txt".to_string()
+        ],
+        "multi-mod discovery must be globally sorted: {logical:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_parity_with_session_preserves_order() {
+    // Same inputs must yield the same file *order*, not just the same set
+    // (#339). Session::load shares discover_workspace_files, so this pins
+    // that no layer re-sorts or shuffles between them.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::write(root.join("common/b.txt"), "my_b = { }\n").unwrap();
+    std::fs::write(root.join("common/a.txt"), "my_a = { }\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(
+        tmp.path().join("rules/f.cwt"),
+        "types = { type[my_a] = { path = \"common\" } type[my_b] = { path = \"common\" } }",
+    )
+    .unwrap();
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(tmp.path().join("rules")),
+        directory: root.clone(),
+        vanilla: None,
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        case_sensitive_files: false,
+        on_rules_diagnostic: None,
+    });
+    let session_paths: Vec<String> = session
+        .parsed_files()
+        .iter()
+        .map(|f| f.logical_path.clone())
+        .collect();
+    let cfg = workspace_discovery_config(&root, Some(session.ruleset()));
+    let direct = discover_workspace_files(cfg).expect("direct discovery");
+    let direct_paths: Vec<String> = direct.iter().map(|f| f.logical_path.clone()).collect();
+    assert_eq!(
+        session_paths, direct_paths,
+        "Session and direct discovery must agree on order without sorting"
+    );
+    let expected = vec!["common/a.txt".to_string(), "common/b.txt".to_string()];
+    assert_eq!(
+        session_paths, expected,
+        "discovery must be sorted: {session_paths:?}"
+    );
+    assert_eq!(
+        direct_paths, expected,
+        "discovery must be sorted: {direct_paths:?}"
+    );
+}
+
 /// validate_all runs the whole batch without panicking and returns one entry
 /// per parsed file. The total error count is deterministic across two loads.
 #[test]
