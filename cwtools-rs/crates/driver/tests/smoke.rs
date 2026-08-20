@@ -219,8 +219,12 @@ fn discover_workspace_files_missing_root_is_error() {
     cfg.root = missing.clone();
     let err = discover_workspace_files(cfg).expect_err("missing root must error");
     assert!(
-        matches!(err, FileError::MissingRoot(_)),
-        "missing root must be FileError::MissingRoot, got: {err:?}"
+        matches!(
+            &err,
+            FileError::MissingRoot(path) if *path == missing
+        ),
+        "missing root must be FileError::MissingRoot({}), got: {err:?}",
+        missing.display()
     );
     assert!(
         err.to_string().contains(&missing.display().to_string()),
@@ -270,6 +274,51 @@ fn discover_workspace_files_multi_mod_layers_and_suppresses_replace_path() {
         by_path.len(),
         2,
         "exactly two logical files must survive: {by_path:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_multi_mod_layers_lower_priority_replace_path_does_not_invalidate_higher_priority_files()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    // A is lower priority (A < B) but declares replace_path.
+    std::fs::write(
+        ws.join("mod/a.mod"),
+        "name = \"A Mod\"\npath = \"alpha\"\nreplace_path = \"common\"\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
+    std::fs::create_dir_all(ws.join("alpha/common")).unwrap();
+    std::fs::create_dir_all(ws.join("bravo/common")).unwrap();
+    std::fs::write(ws.join("alpha/common/shared.txt"), "shared = alpha").unwrap();
+    std::fs::write(ws.join("alpha/common/only_alpha.txt"), "x = 1").unwrap();
+    std::fs::write(ws.join("bravo/common/shared.txt"), "shared = bravo").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&ws, Some(&rs));
+    let files = discover_workspace_files(cfg).expect("multi-mod discovery");
+    let by_path: std::collections::HashMap<String, String> = files
+        .iter()
+        .map(|f| {
+            let content = std::fs::read_to_string(&f.path).unwrap();
+            (f.logical_path.clone(), content)
+        })
+        .collect();
+    // A's replace_path is lower priority, so it cannot suppress B's files.
+    assert_eq!(
+        by_path.get("common/shared.txt").map(|s| s.as_str()),
+        Some("shared = bravo"),
+        "A is lower priority, so B must survive: {by_path:?}"
+    );
+    assert!(
+        by_path.contains_key("common/only_alpha.txt"),
+        "lower-priority lower-priority-only file should survive: {by_path:?}"
+    );
+    assert_eq!(
+        by_path.len(),
+        2,
+        "only shared and alpha-only should survive: {by_path:?}"
     );
 }
 
@@ -356,6 +405,48 @@ fn discover_workspace_files_inherits_engine_baseline_excludes() {
 }
 
 #[test]
+fn discover_workspace_files_inherits_engine_default_excluded_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    std::fs::create_dir_all(root.join("resources")).unwrap();
+    std::fs::create_dir_all(root.join("allowed_dir")).unwrap();
+    std::fs::create_dir_all(root.join("allowed_dir/sub")).unwrap();
+    std::fs::write(root.join("keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("allowed_dir/sub/keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join(".git/ignore.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("target/skip.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("resources/skip.txt"), "x = 1\n").unwrap();
+    let mut cfg = search_config_for(&root);
+    cfg.include_dirs = vec![".".to_string()];
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert!(
+        logical.contains(&"keep.txt".to_string()),
+        "root file should survive: {logical:?}"
+    );
+    assert!(
+        logical
+            .iter()
+            .any(|p| p.ends_with("allowed_dir/sub/keep.txt")),
+        "allowed dir files should survive: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains(".git/ignore.txt")),
+        ".git folder is excluded by default: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains("target/skip.txt")),
+        "target folder is excluded by default: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains("resources/skip.txt")),
+        "resources is excluded at root by default: {logical:?}"
+    );
+}
+
+#[test]
 fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("workspace");
@@ -363,8 +454,18 @@ fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
     std::fs::write(ws.join("mod/a.mod"), "name = \"A Mod\"\npath = \"alpha\"\n").unwrap();
     std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
     for (mod_name, files) in [
-        ("alpha", vec!["common/a.txt", "common/skip.txt"]),
-        ("bravo", vec!["common/b.txt", "common/keep.txt"]),
+        (
+            "alpha",
+            vec!["common/a.txt", "common/skip.txt", "common/skipdir/skip.txt"],
+        ),
+        (
+            "bravo",
+            vec![
+                "common/b.txt",
+                "common/keep.txt",
+                "common/skipdir/ignore.txt",
+            ],
+        ),
     ] {
         for rel in files {
             let p = ws.join(mod_name).join(rel);
@@ -378,7 +479,8 @@ fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
         "types = { type[my_a] = { path = \"common\" } }",
     )
     .unwrap();
-    let ignore = vec!["skip.txt".to_string()];
+    let ignore_files = vec!["skip.txt".to_string()];
+    let ignore_dirs = vec!["skipdir".to_string()];
     let session = Session::load(SessionConfig {
         game: Game::Hoi4,
         rules: RulesInput::Dir(tmp.path().join("rules")),
@@ -386,8 +488,8 @@ fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
         vanilla: None,
         vanilla_cache: None,
         vanilla_cache_auto: None,
-        ignore_files: &ignore,
-        ignore_dirs: &[],
+        ignore_files: &ignore_files,
+        ignore_dirs: &ignore_dirs,
         loc_languages: None,
         case_sensitive_files: false,
         on_rules_diagnostic: None,
@@ -400,15 +502,17 @@ fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
     session_paths.sort();
     let rs = session.ruleset();
     let mut cfg = workspace_discovery_config(&ws, Some(rs));
-    cfg.exclude_patterns.extend(ignore.clone());
+    cfg.exclude_patterns.extend(ignore_files.clone());
+    cfg.exclude_dir_patterns.extend(ignore_dirs.clone());
     let direct = discover_workspace_files(cfg).expect("direct multi-mod discovery");
     let mut direct_paths: Vec<String> = direct.iter().map(|f| f.logical_path.clone()).collect();
     direct_paths.sort();
     assert_eq!(
         session_paths, direct_paths,
-        "Session and direct must agree with ignore_files"
+        "Session and direct must agree with ignore_files and ignore_dirs"
     );
     assert!(!direct_paths.iter().any(|p| p.ends_with("skip.txt")));
+    assert!(!direct_paths.iter().any(|p| p.contains("skipdir/skip.txt")));
 }
 
 // ── index_game_dir ───────────────────────────────────────────────────────────
