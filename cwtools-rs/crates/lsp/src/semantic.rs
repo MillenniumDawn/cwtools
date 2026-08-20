@@ -666,7 +666,11 @@ impl Backend {
         // Fast path: if content hash matches cache, reuse tokens without walking.
         if let Some(text) = self.file_text_for(&uri).await {
             let hash = cwtools_cache::workspace::content_hash(&text);
-            if let Some(entry) = self.state.semantic_tokens_cache.lock().get(&uri).cloned()
+            // Bound to a `let` so the probe's guard drops here: the insert below
+            // takes the same non-reentrant mutex, and a guard in the `if let`
+            // scrutinee would still be alive inside the block (#334).
+            let cached = self.state.semantic_tokens_cache.lock().get(&uri).cloned();
+            if let Some(entry) = cached
                 && entry.hash == hash
             {
                 let result_id = self
@@ -727,7 +731,9 @@ impl Backend {
         // polls during idle ~free).
         if let Some(text) = self.file_text_for(&uri).await {
             let hash = cwtools_cache::workspace::content_hash(&text);
-            if let Some(entry) = self.state.semantic_tokens_cache.lock().get(&uri).cloned()
+            // Same reason as the full request: the insert below re-locks.
+            let cached = self.state.semantic_tokens_cache.lock().get(&uri).cloned();
+            if let Some(entry) = cached
                 && entry.hash == hash
                 && entry.result_id == params.previous_result_id
             {
@@ -1253,5 +1259,133 @@ mod tests {
         let line: Vec<char> = "a = b".chars().collect();
         assert_eq!(find_token_col(&line, "=", 1), Some(2));
         assert_eq!(find_token_col(&line, "!=", 1), None);
+    }
+
+    // ── The cache fast paths ─────────────────────────────────────────────────
+
+    const DOC_URI: &str = if cfg!(windows) {
+        "file:///C:/ws/common/ideas/00_ideas.txt"
+    } else {
+        "file:///ws/common/ideas/00_ideas.txt"
+    };
+
+    fn backend_with_open_doc() -> Backend {
+        let state = std::sync::Arc::new(crate::state::DocumentState::new());
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let slot = captured.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = tower_lsp::LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let client = captured.lock().take().unwrap();
+        state
+            .documents
+            .lock()
+            .open(
+                DOC_URI.to_string(),
+                crate::state::ParsedDoc {
+                    version: 1,
+                    text: std::sync::Arc::from("idea = { cost = 1 }"),
+                    ast: None,
+                    ast_version: None,
+                    ast_source_bytes: 0,
+                },
+            )
+            .unwrap();
+        Backend { client, state }
+    }
+
+    fn full_params() -> SemanticTokensParams {
+        SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse(DOC_URI).unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    /// Run `f` on its own thread and fail if it hasn't returned in 30s.
+    ///
+    /// A self-deadlock wedges the thread that hit it, so the check cannot ride
+    /// the same one — and `tokio::time::timeout` is no help either, since the
+    /// block happens inside `poll` and the timer never gets to run. The stuck
+    /// thread is left behind; the harness tears it down with the process.
+    fn must_finish(name: &str, f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(),
+            "{name} deadlocked on the semantic-token cache mutex"
+        );
+    }
+
+    // The fast path probed the cache in the `if let` scrutinee and re-locked it
+    // in the body. `parking_lot::Mutex` is not reentrant and the scrutinee's
+    // guard outlives the block, so the second identical request wedged the
+    // thread that drives tower-lsp's whole read/dispatch/write loop: the server
+    // went silent mid-scan with no error and no further output (#334).
+    #[test]
+    fn repeat_full_request_does_not_deadlock_on_the_cache() {
+        must_finish("semantic_tokens_full", || {
+            // Multi-thread: the AST snapshot reparses under `block_in_place`.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let backend = backend_with_open_doc();
+                backend
+                    .semantic_tokens_full_impl(full_params())
+                    .await
+                    .unwrap();
+                backend
+                    .semantic_tokens_full_impl(full_params())
+                    .await
+                    .unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn repeat_delta_request_does_not_deadlock_on_the_cache() {
+        must_finish("semantic_tokens_full_delta", || {
+            // Multi-thread: the AST snapshot reparses under `block_in_place`.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let backend = backend_with_open_doc();
+                let first = backend
+                    .semantic_tokens_full_impl(full_params())
+                    .await
+                    .unwrap();
+                let previous_result_id = match first {
+                    Some(SemanticTokensResult::Tokens(tokens)) => tokens.result_id.unwrap(),
+                    other => panic!("expected full tokens, got {other:?}"),
+                };
+                backend
+                    .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: Url::parse(DOC_URI).unwrap(),
+                        },
+                        previous_result_id,
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
     }
 }
