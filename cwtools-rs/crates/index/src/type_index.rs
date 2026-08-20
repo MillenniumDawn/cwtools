@@ -1613,4 +1613,39 @@ mod tests {
         vi.add_name("   ");
         assert_eq!(vi.len(), 2);
     }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut idx = TypeIndex::new();
+        idx.merge(
+            "file://a.txt",
+            HashMap::from([("event".to_string(), vec![inst("ev_a", 1)])]),
+        );
+        idx.merge(
+            "file://b.txt",
+            HashMap::from([("event".to_string(), vec![inst("ev_b", 2)])]),
+        );
+        idx.file_index.insert("gfx/a.dds");
+        idx.var_index.add_name("My_Var");
+        let snap = idx.clone();
+        // Mutate clone, original must not see the mutation.
+        let mut mutated = snap.clone();
+        mutated.merge(
+            "file://c.txt",
+            HashMap::from([("event".to_string(), vec![inst("ev_c", 3)])]),
+        );
+        mutated.file_index.insert("gfx/b.dds");
+        mutated.var_index.add_name("Other_Var");
+        assert!(!idx.contains("event", "ev_c"));
+        assert!(!idx.file_index.contains("gfx/b.dds"));
+        assert!(!idx.var_index.contains("other_var"));
+        assert!(mutated.contains("event", "ev_c"));
+        assert!(mutated.file_index.contains("gfx/b.dds"));
+        assert!(mutated.var_index.contains("other_var"));
+        // Mutate original via remove_file, clone must retain removed entry.
+        let snap2 = idx.clone();
+        idx.remove_file("file://a.txt");
+        assert!(!idx.contains("event", "ev_a"));
+        assert!(snap2.contains("event", "ev_a"));
+    }
 }

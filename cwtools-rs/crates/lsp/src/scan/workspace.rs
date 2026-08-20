@@ -26,6 +26,10 @@ use super::{
     spawn_logging_panics, stat_signature_for,
 };
 
+/// ~one rayon work unit; 256 balances per-chunk rayon parallelism vs UI
+/// cancel/progress yield cadence on a 7k-file corpus.
+const PASS2_CHUNK_SIZE: usize = 256;
+
 impl Backend {
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
     /// status-bar loading indicator on return, regardless of which internal path
@@ -760,18 +764,13 @@ impl Backend {
             Option<u64>,
             InlineIgnoreMap,
         );
-        // Snapshot the indexes so the CPU-bound rayon phase holds no
-        // `info_service` / `loc_index` read guards. A concurrent keystroke
-        // needs `info_service.write()` (validate.rs) and previously blocked
-        // for the whole validate phase; the snapshot is taken under brief
-        // read guards and the remainder runs lock-free, matching the loc
-        // rebuild pointer-swap shape (build outside locks, install with swap).
-        // Chunking the rayon work yields to the async runtime between chunks
-        // so cancellation and progress remain responsive on large mods.
+        // Snapshot indexes under brief read guards so rayon holds no
+        // `info_service`/`loc_index` locks; a keystroke needing `write()` no
+        // longer blocks for the whole pass (pointer-swap shape, yield between
+        // chunks for cancel/progress on large mods).
         let type_index_snap = self.state.info_service.read().type_index.clone();
         let loc_index_snap = self.state.loc_index.read().clone();
         let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
-        const PASS2_CHUNK: usize = 256;
         let registry = scan_registry.as_ref();
         let prepared = scan_ruleset.as_ref().map(|ruleset| {
             make_prepared(
@@ -788,18 +787,24 @@ impl Backend {
             )
         });
         let mut chunked_results: Vec<ValidationOutcome> = Vec::with_capacity(scan_files.len());
-        let mut cancelled = false;
-        for chunk_start in (0..scan_files.len()).step_by(PASS2_CHUNK) {
+        for ((files_chunk, parsed_chunk), (hashes_chunk, ignores_chunk)) in scan_files
+            .chunks(PASS2_CHUNK_SIZE)
+            .zip(parsed_files.chunks(PASS2_CHUNK_SIZE))
+            .zip(
+                source_hashes
+                    .chunks(PASS2_CHUNK_SIZE)
+                    .zip(inline_ignores.chunks(PASS2_CHUNK_SIZE)),
+            )
+        {
             if cancel.is_cancelled() {
-                cancelled = true;
-                break;
+                validate_ticker.stop();
+                return false;
             }
-            let chunk_end = (chunk_start + PASS2_CHUNK).min(scan_files.len());
-            let chunk_results: Vec<ValidationOutcome> = scan_files[chunk_start..chunk_end]
+            let chunk_results: Vec<ValidationOutcome> = files_chunk
                 .par_iter()
-                .zip(parsed_files[chunk_start..chunk_end].par_iter())
-                .zip(source_hashes[chunk_start..chunk_end].par_iter())
-                .zip(inline_ignores[chunk_start..chunk_end].par_iter())
+                .zip(parsed_chunk.par_iter())
+                .zip(hashes_chunk.par_iter())
+                .zip(ignores_chunk.par_iter())
                 .filter_map(|(((file, parsed_opt), source_hash), inline_ignored)| {
                     if cancel.is_cancelled() {
                         return None;
@@ -832,24 +837,12 @@ impl Backend {
                     ))
                 })
                 .collect();
-            // `filter_map` returns `None` for cancelled files, so a mid-chunk
-            // cancel shows up as a short chunk; check the flag before the next
-            // chunk rather than inferring from length.
             chunked_results.extend(chunk_results);
-            // Yield to the async runtime between chunks so an `info_service.write()`
-            // waiter (keystroke) and `validate_ticker` progress can interleave.
-            // The rayon phase itself holds no index locks (snapshot), so this
-            // yield is for cancellation / progress, not lock release — the
-            // snapshot creation above was the only guarded window.
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
-                cancelled = true;
-                break;
+                validate_ticker.stop();
+                return false;
             }
-        }
-        if cancelled {
-            validate_ticker.stop();
-            return false;
         }
         let mut results: Vec<ValidationOutcome> = chunked_results;
         // Unused-instance second phase: same global merge as before, but against

@@ -570,4 +570,27 @@ alias[effect:generate_character] = {
         idx.remove_file("b.txt");
         assert!(idx.values("country_flag").next().is_none());
     }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut idx = NamedValueIndex::new();
+        idx.merge_file(
+            "a.txt",
+            HashMap::from([("country_flag".to_string(), vec!["a_flag".to_string()])]),
+        );
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.merge_file(
+            "b.txt",
+            HashMap::from([("country_flag".to_string(), vec!["b_flag".to_string()])]),
+        );
+        assert!(!idx.contains("country_flag", "b_flag"));
+        assert!(mutated.contains("country_flag", "b_flag"));
+        assert!(snap.contains("country_flag", "a_flag"));
+        assert!(!snap.contains("country_flag", "b_flag"));
+        // Removing from original must not affect clone.
+        idx.remove_file("a.txt");
+        assert!(!idx.contains("country_flag", "a_flag"));
+        assert!(snap.contains("country_flag", "a_flag"));
+    }
 }
