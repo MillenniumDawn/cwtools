@@ -1298,6 +1298,46 @@ pub fn is_ignored_file(
     is_ignored_logical_path(&logical, extra_file_globs)
 }
 
+/// Excluded by engine baseline, file globs, engine directory lists, or directory
+/// globs. This is the predicate workspace discovery applies, surfaced so the
+/// LSP's incremental paths cannot drift from a full scan.
+pub fn is_ignored_path(
+    logical_path: &str,
+    extra_file_globs: &[String],
+    extra_dir_globs: &[String],
+) -> bool {
+    if is_ignored_logical_path(logical_path, extra_file_globs) {
+        return true;
+    }
+    if extra_dir_globs.is_empty() {
+        return false;
+    }
+    let normalized = if logical_path.contains('\\') {
+        logical_path.replace('\\', "/")
+    } else {
+        logical_path.to_string()
+    };
+    let segments: Vec<&str> = normalized.split('/').collect();
+    // A bare filename has no parent directories to match against.
+    if segments.len() < 2 {
+        return false;
+    }
+    let mut dir_relative = String::new();
+    for (i, dir_name) in segments.iter().take(segments.len() - 1).enumerate() {
+        if i > 0 {
+            dir_relative.push('/');
+        }
+        dir_relative.push_str(dir_name);
+        if extra_dir_globs
+            .iter()
+            .any(|pat| ignore_glob_match(pat, dir_name, &dir_relative))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Path-aware glob: `**` spans any run of directories (including none), while
 /// `*` and `?` stay inside one segment. That segment boundary is the whole
 /// reason this can't be [`glob_match`] over the joined path, where `*` would
@@ -2481,6 +2521,118 @@ mod tests {
             );
             assert!(
                 !is_ignored_logical_path(rel, &extra),
+                "predicate must agree it is kept: {rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_ignored_path_applies_dir_globs() {
+        // Bare directory name matches at any depth.
+        assert!(is_ignored_path("scratch/foo.txt", &[], &["scratch".into()]));
+        assert!(is_ignored_path(
+            "common/scratch/foo.txt",
+            &[],
+            &["scratch".into()]
+        ));
+        assert!(!is_ignored_path(
+            "common/keep/foo.txt",
+            &[],
+            &["scratch".into()]
+        ));
+        // Path-aware directory glob.
+        assert!(is_ignored_path(
+            "common/scratch/foo.txt",
+            &[],
+            &["common/scratch".into()]
+        ));
+        assert!(!is_ignored_path(
+            "events/scratch/foo.txt",
+            &[],
+            &["common/scratch".into()]
+        ));
+        assert!(is_ignored_path(
+            "a/b/scratch/foo.txt",
+            &[],
+            &["**/scratch".into()]
+        ));
+        // File and directory globs stack.
+        assert!(is_ignored_path(
+            "scratch/README.txt",
+            &[],
+            &["scratch".into()]
+        ));
+        assert!(is_ignored_path(
+            "common/ignored.txt",
+            &["ignored.txt".into()],
+            &[]
+        ));
+        assert!(is_ignored_path(
+            "scratch/ignored.txt",
+            &["ignored.txt".into()],
+            &["scratch".into()]
+        ));
+    }
+
+    #[test]
+    fn is_ignored_path_uses_baseline_file_patterns() {
+        assert!(is_ignored_path("README.txt", &[], &[]));
+        assert!(is_ignored_path("docs/readme.md", &[], &[]));
+        assert!(!is_ignored_path("common/ideas/foo.txt", &[], &[]));
+    }
+
+    #[test]
+    fn is_ignored_path_handles_windows_separators() {
+        assert!(is_ignored_path(
+            "common\\scratch/foo.txt",
+            &[],
+            &["scratch".into()]
+        ));
+        assert!(is_ignored_path(
+            "common/scratch/foo.txt",
+            &[],
+            &["common\\scratch".into()]
+        ));
+    }
+
+    #[test]
+    fn is_ignored_path_agrees_with_walk_workspace_files_for_dirs() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        for rel in [
+            "scratch/foo.txt",
+            "common/scratch/foo.txt",
+            "common/keep/foo.txt",
+            "events/keep.txt",
+        ] {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(rel), "").unwrap();
+        }
+        let extra_dirs = vec!["scratch".to_string(), "**/skip".to_string()];
+        let walked = walk_workspace_files(root, &["txt"], &[], &extra_dirs, ScanBudget::default());
+        let walked_set: std::collections::HashSet<String> = walked
+            .iter()
+            .map(|p| compute_logical_path(p, root))
+            .collect();
+        for rel in ["scratch/foo.txt", "common/scratch/foo.txt"] {
+            assert!(
+                !walked_set.contains(rel),
+                "walk should have excluded {rel}: {walked_set:?}"
+            );
+            assert!(
+                is_ignored_path(rel, &[], &extra_dirs),
+                "predicate must agree it is ignored: {rel}"
+            );
+        }
+        for rel in ["common/keep/foo.txt", "events/keep.txt"] {
+            assert!(
+                walked_set.contains(rel),
+                "walk should have kept {rel}: {walked_set:?}"
+            );
+            assert!(
+                !is_ignored_path(rel, &[], &extra_dirs),
                 "predicate must agree it is kept: {rel}"
             );
         }
