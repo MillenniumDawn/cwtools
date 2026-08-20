@@ -285,7 +285,7 @@ impl Backend {
         // `cwtools validate` and the editor see the same file set. The config
         // is narrowed to the ruleset's `folders` and handles multi-mod
         // layering in one place (#284).
-        let files_to_validate = tokio::task::block_in_place(|| {
+        let discovery = tokio::task::block_in_place(|| {
             let mut fm_config =
                 cwtools_driver::workspace_discovery_config(&root_path, ruleset.as_deref());
             fm_config
@@ -294,14 +294,25 @@ impl Backend {
             fm_config
                 .exclude_dir_patterns
                 .extend(extra_dir_globs.iter().cloned());
-            match cwtools_driver::discover_workspace_files(fm_config) {
-                Ok(files) => files.into_iter().map(|f| f.path).collect(),
-                Err(error) => {
-                    tracing::warn!(path = %root_path.display(), error = %error, "workspace discovery failed");
-                    Vec::new()
-                }
-            }
+            cwtools_driver::discover_workspace_files(fm_config)
         });
+        let files_to_validate = match discovery {
+            Ok(files) => files.into_iter().map(|f| f.path).collect(),
+            Err(error) => {
+                tracing::error!(path = %root_path.display(), error = %error, "workspace discovery failed");
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "error: discovery failed for {}: {}",
+                            root_path.display(),
+                            error
+                        ),
+                    )
+                    .await;
+                Vec::new()
+            }
+        };
 
         // Quiet-pass short-circuit: skip reindex + revalidate + re-publish when
         // the walked-files fingerprint and settings generation both match the
