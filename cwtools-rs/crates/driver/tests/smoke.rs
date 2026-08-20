@@ -12,9 +12,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cwtools_driver::{
-    RulesInput, Session, SessionConfig, VanillaCacheAuto, build_vanilla_cache_aux, index_game_dir,
-    search_config_for,
+    RulesInput, Session, SessionConfig, VanillaCacheAuto, build_vanilla_cache_aux,
+    discover_workspace_files, index_game_dir, search_config_for, workspace_discovery_config,
 };
+use cwtools_file_manager::file_manager::FileError;
 use cwtools_game::constants::Game;
 use cwtools_index::variable_defining_effects;
 use cwtools_localization::Lang;
@@ -90,6 +91,428 @@ fn search_config_subfolders_only_uses_default() {
 
     let config = search_config_for(&root);
     assert_ne!(config.include_dirs, vec![".".to_string()]);
+}
+
+// ── workspace_discovery_config / discover_workspace_files (#284) ───────────────
+
+fn ruleset_with_folders(folders: &[&str]) -> cwtools_rules::rules_types::RuleSet {
+    let mut rs = cwtools_rules::rules_types::RuleSet::new();
+    rs.folders = folders.iter().map(|s| s.to_string()).collect();
+    rs
+}
+
+#[test]
+fn workspace_discovery_config_with_no_ruleset_matches_search_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    // No ruleset -> same as plain search_config_for.
+    let via_none = workspace_discovery_config(&root, None);
+    let via_search = search_config_for(&root);
+    assert_eq!(via_none.include_dirs, via_search.include_dirs);
+    assert_eq!(via_none.root, via_search.root);
+}
+
+#[test]
+fn workspace_discovery_config_empty_folders_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    let empty = ruleset_with_folders(&[]);
+    let cfg = workspace_discovery_config(&root, Some(&empty));
+    let base = search_config_for(&root);
+    assert_eq!(cfg.include_dirs, base.include_dirs);
+}
+
+#[test]
+fn workspace_discovery_narrows_to_folders_when_root_contains_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::create_dir_all(root.join("events")).unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&root, Some(&rs));
+    assert_eq!(cfg.include_dirs, vec!["common".to_string()]);
+}
+
+#[test]
+fn workspace_discovery_keeps_defaults_when_root_lacks_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    // No subdir matching the ruleset folder exists.
+    std::fs::create_dir_all(root.join("other")).unwrap();
+    let rs = ruleset_with_folders(&["common", "events"]);
+    let cfg = workspace_discovery_config(&root, Some(&rs));
+    let base = search_config_for(&root);
+    assert_eq!(
+        cfg.include_dirs, base.include_dirs,
+        "apply_config_folders must not fire when no listed folder exists on disk"
+    );
+}
+
+#[test]
+fn workspace_discovery_multi_mod_overrides_even_without_root_folder_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    // Descriptor that makes `ws` classify as MultipleMod.
+    std::fs::write(ws.join("mod/test.mod"), "name = \"X\"\npath = \"alpha\"\n").unwrap();
+    std::fs::create_dir_all(ws.join("alpha")).unwrap();
+    // Note: `ws` itself has no `myfolder/` child — apply_config_folders alone
+    // would leave include_dirs unchanged. The multi-mod branch must still
+    // force the ruleset folders.
+    let rs = ruleset_with_folders(&["myfolder"]);
+    let cfg = workspace_discovery_config(&ws, Some(&rs));
+    assert_eq!(cfg.include_dirs, vec!["myfolder".to_string()]);
+}
+
+#[test]
+fn discover_workspace_files_single_mod_respects_include_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::create_dir_all(root.join("events")).unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("common/a.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("events/b.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("docs/c.txt"), "x = 1\n").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&root, Some(&rs));
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert!(
+        logical.iter().any(|p| p == "common/a.txt"),
+        "common/a.txt must be discovered: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p == "events/b.txt"),
+        "events/b.txt must be excluded by narrowed include_dirs: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p == "docs/c.txt"),
+        "docs/c.txt must be excluded: {logical:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_extra_ignore_globs_filter_after_narrowing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::write(root.join("common/keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("common/skip.txt"), "x = 1\n").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let mut cfg = workspace_discovery_config(&root, Some(&rs));
+    cfg.exclude_patterns.push("skip.txt".to_string());
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert!(logical.contains(&"common/keep.txt".to_string()));
+    assert!(!logical.contains(&"common/skip.txt".to_string()));
+}
+
+#[test]
+fn discover_workspace_files_missing_root_is_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("no_such_mod");
+    let rs = ruleset_with_folders(&["common"]);
+    let mut cfg = workspace_discovery_config(&missing, Some(&rs));
+    cfg.root = missing.clone();
+    let err = discover_workspace_files(cfg).expect_err("missing root must error");
+    assert!(
+        matches!(
+            &err,
+            FileError::MissingRoot(path) if *path == missing
+        ),
+        "missing root must be FileError::MissingRoot({}), got: {err:?}",
+        missing.display()
+    );
+    assert!(
+        err.to_string().contains(&missing.display().to_string()),
+        "error must name the missing root, got: {err}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_multi_mod_layers_and_suppresses_replace_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    // B is higher priority (B > A name-sorted) and declares replace_path.
+    std::fs::write(ws.join("mod/a.mod"), "name = \"A Mod\"\npath = \"alpha\"\n").unwrap();
+    std::fs::write(
+        ws.join("mod/b.mod"),
+        "name = \"B Mod\"\npath = \"bravo\"\nreplace_path = \"common\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(ws.join("alpha/common")).unwrap();
+    std::fs::create_dir_all(ws.join("bravo/common")).unwrap();
+    std::fs::write(ws.join("alpha/common/shared.txt"), "shared = alpha").unwrap();
+    std::fs::write(ws.join("bravo/common/shared.txt"), "shared = bravo").unwrap();
+    std::fs::write(ws.join("bravo/common/only_bravo.txt"), "x = 1").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&ws, Some(&rs));
+    assert_eq!(cfg.include_dirs, vec!["common".to_string()]);
+    let files = discover_workspace_files(cfg).expect("multi-mod discovery");
+    let by_path: std::collections::HashMap<String, String> = files
+        .iter()
+        .map(|f| {
+            let content = std::fs::read_to_string(&f.path).unwrap();
+            (f.logical_path.clone(), content)
+        })
+        .collect();
+    // B's replace_path must suppress A's lower-priority shared file.
+    assert_eq!(
+        by_path.get("common/shared.txt").map(|s| s.as_str()),
+        Some("shared = bravo"),
+        "B Mod (higher priority) with replace_path must win: {by_path:?}"
+    );
+    assert!(
+        by_path.contains_key("common/only_bravo.txt"),
+        "non-shared file must survive: {by_path:?}"
+    );
+    assert_eq!(
+        by_path.len(),
+        2,
+        "exactly two logical files must survive: {by_path:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_multi_mod_layers_lower_priority_replace_path_does_not_invalidate_higher_priority_files()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    // A is lower priority (A < B) but declares replace_path.
+    std::fs::write(
+        ws.join("mod/a.mod"),
+        "name = \"A Mod\"\npath = \"alpha\"\nreplace_path = \"common\"\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
+    std::fs::create_dir_all(ws.join("alpha/common")).unwrap();
+    std::fs::create_dir_all(ws.join("bravo/common")).unwrap();
+    std::fs::write(ws.join("alpha/common/shared.txt"), "shared = alpha").unwrap();
+    std::fs::write(ws.join("alpha/common/only_alpha.txt"), "x = 1").unwrap();
+    std::fs::write(ws.join("bravo/common/shared.txt"), "shared = bravo").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let cfg = workspace_discovery_config(&ws, Some(&rs));
+    let files = discover_workspace_files(cfg).expect("multi-mod discovery");
+    let by_path: std::collections::HashMap<String, String> = files
+        .iter()
+        .map(|f| {
+            let content = std::fs::read_to_string(&f.path).unwrap();
+            (f.logical_path.clone(), content)
+        })
+        .collect();
+    // A's replace_path is lower priority, so it cannot suppress B's files.
+    assert_eq!(
+        by_path.get("common/shared.txt").map(|s| s.as_str()),
+        Some("shared = bravo"),
+        "A is lower priority, so B must survive: {by_path:?}"
+    );
+    assert!(
+        by_path.contains_key("common/only_alpha.txt"),
+        "lower-priority lower-priority-only file should survive: {by_path:?}"
+    );
+    assert_eq!(
+        by_path.len(),
+        2,
+        "only shared and alpha-only should survive: {by_path:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_parity_with_session_discovery() {
+    // Session::load must discover the same file set as the standalone
+    // discover_workspace_files primitive when given identical inputs (#284).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::create_dir_all(root.join("events")).unwrap();
+    std::fs::write(root.join("common/a.txt"), "my_a = { }\n").unwrap();
+    std::fs::write(root.join("events/b.txt"), "my_b = { }\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(
+        tmp.path().join("rules/f.cwt"),
+        "types = { type[my_a] = { path = \"common\" } type[my_b] = { path = \"events\" } }",
+    )
+    .unwrap();
+    // Session path.
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(tmp.path().join("rules")),
+        directory: root.clone(),
+        vanilla: None,
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        case_sensitive_files: false,
+        on_rules_diagnostic: None,
+    });
+    let mut session_paths: Vec<String> = session
+        .parsed_files()
+        .iter()
+        .map(|f| f.logical_path.clone())
+        .collect();
+    session_paths.sort();
+    // Direct primitive path using the session's own ruleset.
+    let cfg = workspace_discovery_config(&root, Some(session.ruleset()));
+    let direct = discover_workspace_files(cfg).expect("direct discovery");
+    let mut direct_paths: Vec<String> = direct.iter().map(|f| f.logical_path.clone()).collect();
+    direct_paths.sort();
+    assert_eq!(session_paths, direct_paths);
+}
+
+#[test]
+fn discover_workspace_files_inherits_engine_baseline_excludes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::write(root.join("common/keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("common/Changelog.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("common/README.md"), "x\n").unwrap();
+    std::fs::write(root.join("common/notes.md"), "x\n").unwrap();
+    let rs = ruleset_with_folders(&["common"]);
+    let mut cfg = workspace_discovery_config(&root, Some(&rs));
+    cfg.exclude_dir_patterns.push("build".to_string());
+    std::fs::create_dir_all(root.join("common/build")).unwrap();
+    std::fs::write(root.join("common/build/skip.txt"), "x = 1\n").unwrap();
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert!(
+        logical.contains(&"common/keep.txt".to_string()),
+        "keep must survive: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.ends_with("Changelog.txt")),
+        "baseline exclude Changelog.txt: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.ends_with("README.md")),
+        "baseline *.md: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.ends_with("notes.md")),
+        "baseline *.md: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains("build/skip.txt")),
+        "dir glob build: {logical:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_inherits_engine_default_excluded_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("modroot");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    std::fs::create_dir_all(root.join("resources")).unwrap();
+    std::fs::create_dir_all(root.join("allowed_dir")).unwrap();
+    std::fs::create_dir_all(root.join("allowed_dir/sub")).unwrap();
+    std::fs::write(root.join("keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("allowed_dir/sub/keep.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join(".git/ignore.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("target/skip.txt"), "x = 1\n").unwrap();
+    std::fs::write(root.join("resources/skip.txt"), "x = 1\n").unwrap();
+    let mut cfg = search_config_for(&root);
+    cfg.include_dirs = vec![".".to_string()];
+    let files = discover_workspace_files(cfg).expect("discovery");
+    let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+    assert!(
+        logical.contains(&"keep.txt".to_string()),
+        "root file should survive: {logical:?}"
+    );
+    assert!(
+        logical
+            .iter()
+            .any(|p| p.ends_with("allowed_dir/sub/keep.txt")),
+        "allowed dir files should survive: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains(".git/ignore.txt")),
+        ".git folder is excluded by default: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains("target/skip.txt")),
+        "target folder is excluded by default: {logical:?}"
+    );
+    assert!(
+        !logical.iter().any(|p| p.contains("resources/skip.txt")),
+        "resources is excluded at root by default: {logical:?}"
+    );
+}
+
+#[test]
+fn discover_workspace_files_parity_with_session_discovery_multi_mod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("mod")).unwrap();
+    std::fs::write(ws.join("mod/a.mod"), "name = \"A Mod\"\npath = \"alpha\"\n").unwrap();
+    std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
+    for (mod_name, files) in [
+        (
+            "alpha",
+            vec!["common/a.txt", "common/skip.txt", "common/skipdir/skip.txt"],
+        ),
+        (
+            "bravo",
+            vec![
+                "common/b.txt",
+                "common/keep.txt",
+                "common/skipdir/ignore.txt",
+            ],
+        ),
+    ] {
+        for rel in files {
+            let p = ws.join(mod_name).join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x = 1\n").unwrap();
+        }
+    }
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(
+        tmp.path().join("rules/f.cwt"),
+        "types = { type[my_a] = { path = \"common\" } }",
+    )
+    .unwrap();
+    let ignore_files = vec!["skip.txt".to_string()];
+    let ignore_dirs = vec!["skipdir".to_string()];
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(tmp.path().join("rules")),
+        directory: ws.clone(),
+        vanilla: None,
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &ignore_files,
+        ignore_dirs: &ignore_dirs,
+        loc_languages: None,
+        case_sensitive_files: false,
+        on_rules_diagnostic: None,
+    });
+    let mut session_paths: Vec<String> = session
+        .parsed_files()
+        .iter()
+        .map(|f| f.logical_path.clone())
+        .collect();
+    session_paths.sort();
+    let rs = session.ruleset();
+    let mut cfg = workspace_discovery_config(&ws, Some(rs));
+    cfg.exclude_patterns.extend(ignore_files.clone());
+    cfg.exclude_dir_patterns.extend(ignore_dirs.clone());
+    let direct = discover_workspace_files(cfg).expect("direct multi-mod discovery");
+    let mut direct_paths: Vec<String> = direct.iter().map(|f| f.logical_path.clone()).collect();
+    direct_paths.sort();
+    assert_eq!(
+        session_paths, direct_paths,
+        "Session and direct must agree with ignore_files and ignore_dirs"
+    );
+    assert!(!direct_paths.iter().any(|p| p.ends_with("skip.txt")));
+    assert!(!direct_paths.iter().any(|p| p.contains("skipdir/skip.txt")));
 }
 
 // ── index_game_dir ───────────────────────────────────────────────────────────

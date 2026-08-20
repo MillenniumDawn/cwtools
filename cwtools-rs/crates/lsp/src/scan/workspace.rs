@@ -268,11 +268,9 @@ impl Backend {
             }
         };
 
-        let extensions = cwtools_file_manager::file_manager::SCRIPT_EXTENSIONS;
-
         // Snapshot the user-configured ignore globs once for the whole walk.
         // The engine's hard-coded baseline (Changelog.txt, README.*, *.md)
-        // is layered on top inside the walker closure so it can't be
+        // is layered on top inside the driver config so it can't be
         // accidentally cleared by a user who sets an empty list.
         let (extra_file_globs, extra_dir_globs) = {
             let cfg = self.state.config.read();
@@ -281,18 +279,28 @@ impl Backend {
                 cfg.ignore_dir_patterns.clone(),
             )
         };
+        let ruleset = self.state.rules.read().ruleset.clone();
 
-        // Whole-tree discovery shares file_manager's skip/exclude config so the
-        // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
-        // The user-configured globs extend that baseline.
+        // Workspace discovery goes through the shared driver primitive so
+        // `cwtools validate` and the editor see the same file set. The config
+        // is narrowed to the ruleset's `folders` and handles multi-mod
+        // layering in one place (#284).
         let files_to_validate = tokio::task::block_in_place(|| {
-            cwtools_file_manager::file_manager::walk_workspace_files(
-                &root_path,
-                extensions,
-                &extra_file_globs,
-                &extra_dir_globs,
-                cwtools_file_manager::file_manager::ScanBudget::default(),
-            )
+            let mut fm_config =
+                cwtools_driver::workspace_discovery_config(&root_path, ruleset.as_deref());
+            fm_config
+                .exclude_patterns
+                .extend(extra_file_globs.iter().cloned());
+            fm_config
+                .exclude_dir_patterns
+                .extend(extra_dir_globs.iter().cloned());
+            match cwtools_driver::discover_workspace_files(fm_config) {
+                Ok(files) => files.into_iter().map(|f| f.path).collect(),
+                Err(error) => {
+                    tracing::warn!(path = %root_path.display(), error = %error, "workspace discovery failed");
+                    Vec::new()
+                }
+            }
         });
 
         // Quiet-pass short-circuit: skip reindex + revalidate + re-publish when
