@@ -639,9 +639,10 @@ impl Backend {
     pub(crate) fn is_ignored_uri(&self, uri: &str) -> bool {
         let cfg = self.state.config.read();
         let logical = logical_path_from_uri(uri, &cfg.workspace_prefix);
-        cwtools_file_manager::file_manager::is_ignored_logical_path(
+        cwtools_file_manager::file_manager::is_ignored_path(
             &logical,
             &cfg.ignore_file_patterns,
+            &cfg.ignore_dir_patterns,
         )
     }
 
@@ -3016,6 +3017,19 @@ mod ignored_tests {
         Backend { client, state }
     }
 
+    fn backend_with_ignore_and_dirs(
+        file_patterns: Vec<String>,
+        dir_patterns: Vec<String>,
+        workspace_uri: Option<&str>,
+    ) -> Backend {
+        let backend = backend_with_ignore(file_patterns, workspace_uri);
+        {
+            let mut cfg = backend.state.config.write();
+            cfg.ignore_dir_patterns = dir_patterns;
+        }
+        backend
+    }
+
     #[test]
     fn is_ignored_uri_respects_engine_baseline() {
         let backend = backend_with_ignore(vec![], Some("file:///ws"));
@@ -3058,6 +3072,26 @@ mod ignored_tests {
         // README baseline under encoded workspace.
         assert!(backend2.is_ignored_uri("file:///tmp/My%20Mod/README.txt"));
         assert!(backend2.is_ignored_uri("file:///tmp/My%20Mod/sub/README.txt"));
+    }
+
+    #[test]
+    fn is_ignored_uri_respects_dir_globs() {
+        let backend = backend_with_ignore_and_dirs(
+            vec![],
+            vec!["scratch".into(), "**/temp".into()],
+            Some("file:///ws"),
+        );
+        assert!(backend.is_ignored_uri("file:///ws/scratch/foo.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/common/temp/foo.txt"));
+        assert!(!backend.is_ignored_uri("file:///ws/common/keep/foo.txt"));
+
+        let backend2 = backend_with_ignore_and_dirs(
+            vec![],
+            vec!["common/scratch/**".into()],
+            Some("file:///ws"),
+        );
+        assert!(!backend2.is_ignored_uri("file:///ws/scratch/foo.txt"));
+        assert!(backend2.is_ignored_uri("file:///ws/common/scratch/foo.txt"));
     }
 
     #[test]
@@ -3537,6 +3571,56 @@ mod ignored_tests {
             "watched batch must index kept file"
         );
         // Ignored must have been cleared and not left with a watched signature.
+        assert!(
+            !backend
+                .state
+                .watched_signatures
+                .lock()
+                .contains_key(ignored_uri.as_str()),
+            "ignored watched file must not retain signature"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watched_batch_ignored_dir_not_inserted_into_file_index() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let ws_uri = Url::from_file_path(tmp.path()).unwrap().to_string();
+        let backend = backend_with_ignore_and_dirs(vec![], vec!["scratch".into()], Some(&ws_uri));
+        let ignored_path = tmp.path().join("scratch/ignored.txt");
+        let kept_path = tmp.path().join("kept.txt");
+        std::fs::create_dir_all(ignored_path.parent().unwrap()).unwrap();
+        std::fs::write(&ignored_path, "ignored = { }").unwrap();
+        std::fs::write(&kept_path, "kept = { }").unwrap();
+        let ignored_uri = Url::from_file_path(&ignored_path).unwrap().to_string();
+        let kept_uri = Url::from_file_path(&kept_path).unwrap().to_string();
+        {
+            let mut info = backend.state.info_service.write();
+            info.type_index.file_index.insert("dummy.txt");
+        }
+        let mut changes = std::collections::HashSet::new();
+        changes.insert(ignored_uri.clone());
+        changes.insert(kept_uri.clone());
+        backend.process_watched_batch(changes, vec![]).await;
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .file_index
+                .contains("scratch/ignored.txt"),
+            "watched batch must not index file under ignored directory"
+        );
+        assert!(
+            backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .file_index
+                .contains("kept.txt"),
+            "watched batch must index kept file"
+        );
         assert!(
             !backend
                 .state
