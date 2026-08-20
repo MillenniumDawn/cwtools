@@ -1149,8 +1149,11 @@ impl LanguageServer for Backend {
             };
             if let Some((old_uri, new_uri, doc)) = moved {
                 let _ = self.state.documents.lock().open(new_uri.clone(), doc);
-                // Move cached tokens to the new URI so delta resumes.
-                if let Some(entry) = self.state.semantic_tokens_cache.lock().remove(&old_uri) {
+                // Move cached tokens to the new URI so delta resumes. Bound to a
+                // `let` so the take's guard drops before the insert re-locks the
+                // same non-reentrant mutex (#334).
+                let moved_tokens = self.state.semantic_tokens_cache.lock().remove(&old_uri);
+                if let Some(entry) = moved_tokens {
                     self.state
                         .semantic_tokens_cache
                         .lock()
