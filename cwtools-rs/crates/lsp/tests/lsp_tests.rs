@@ -7989,6 +7989,57 @@ fn test_unknown_execute_command_returns_error() {
 }
 
 #[test]
+fn test_validate_workspace_command_returns_summary() {
+    // `validateWorkspace` runs a full scan and returns aggregate counts.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // One malformed closed file is enough to produce a non-zero error count.
+    let bad = ws.path().join("common/decisions/bad.txt");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, "bad_dec = {\n").unwrap();
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            902,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "validateWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let raw = read_response(&mut reader).expect("no response to validateWorkspace");
+    child.kill().ok();
+
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let result = v["result"]
+        .as_object()
+        .expect("validateWorkspace returned an object");
+    assert_eq!(
+        result["totalFiles"].as_u64(),
+        Some(1),
+        "summary must count the one workspace file, got: {result:?}"
+    );
+    assert_eq!(
+        result["validatedFiles"].as_u64(),
+        Some(1),
+        "summary must count the one validated file, got: {result:?}"
+    );
+    assert_eq!(
+        result["filesWithErrors"].as_u64(),
+        Some(1),
+        "the malformed file must carry an error, got: {result:?}"
+    );
+    assert!(
+        result["totalErrors"].as_u64().unwrap_or(0) > 0,
+        "summary must report a positive error count, got: {result:?}"
+    );
+}
+
+#[test]
 fn test_did_open_burst_stops_at_the_document_count_limit() {
     const MAX_OPEN_DOCUMENTS: usize = 128;
 

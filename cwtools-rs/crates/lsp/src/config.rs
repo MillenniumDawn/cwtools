@@ -369,6 +369,13 @@ impl Backend {
             if let Some(secs) = extract_u64_setting(opts, "backgroundReindexIdleSeconds") {
                 self.state.config.write().background_reindex_idle_seconds = secs;
             }
+
+            // Whether to publish diagnostics for closed workspace files. The
+            // default keeps the Problems panel up to date across the whole mod;
+            // turning it off scopes diagnostics to open documents only.
+            if let Some(wide) = extract_bool_setting(opts, "workspaceWideDiagnostics") {
+                self.state.config.write().workspace_wide_diagnostics = wide;
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -621,6 +628,7 @@ impl Backend {
                         "genlocall".to_string(),
                         "fixAllWorkspace".to_string(),
                         "reindexWorkspace".to_string(),
+                        "validateWorkspace".to_string(),
                         // The extension greys out its graph commands unless it
                         // finds this name here (`graphAvailability.ts`).
                         "getGraphData".to_string(),
@@ -1118,6 +1126,8 @@ impl Backend {
         let hover_all_languages = extract_bool_setting(&params.settings, "hoverShowAllLanguages");
         let hover_debug = extract_bool_setting(&params.settings, "hoverDebug");
         let hover_resolved_scope = extract_hover_scope_display(&params.settings);
+        let workspace_wide_diagnostics =
+            extract_bool_setting(&params.settings, "workspaceWideDiagnostics");
 
         let (
             current_loc_languages,
@@ -1126,6 +1136,7 @@ impl Backend {
             current_codes,
             current_reindex_minutes,
             current_reindex_idle_secs,
+            current_workspace_wide,
         ) = {
             let cfg = self.state.config.read();
             (
@@ -1135,6 +1146,7 @@ impl Backend {
                 cfg.ignored_error_codes.clone(),
                 cfg.background_reindex_interval_minutes,
                 cfg.background_reindex_idle_seconds,
+                cfg.workspace_wide_diagnostics,
             )
         };
         let (current_hover_all, current_hover_debug, current_hover_resolved_scope) = (
@@ -1152,7 +1164,8 @@ impl Backend {
                 .is_none_or(|languages| languages == &current_loc_languages)
             && hover_all_languages.is_none_or(|all| all == current_hover_all)
             && hover_debug.is_none_or(|debug| debug == current_hover_debug)
-            && hover_resolved_scope.is_none_or(|resolved| resolved == current_hover_resolved_scope);
+            && hover_resolved_scope.is_none_or(|resolved| resolved == current_hover_resolved_scope)
+            && workspace_wide_diagnostics.is_none_or(|wide| wide == current_workspace_wide);
         if unchanged {
             tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
             return;
@@ -1164,6 +1177,8 @@ impl Backend {
             .as_ref()
             .is_some_and(|languages| languages != &current_loc_languages);
         let hover_all_changed = hover_all_languages.is_some_and(|all| all != current_hover_all);
+        let workspace_wide_changed =
+            workspace_wide_diagnostics.is_some_and(|wide| wide != current_workspace_wide);
         {
             // Any field written here must join the comparison above, or an
             // identical re-send of a changed field will slip past the guard.
@@ -1182,6 +1197,9 @@ impl Backend {
             }
             if let Some(secs) = reindex_idle_secs {
                 cfg.background_reindex_idle_seconds = secs;
+            }
+            if let Some(wide) = workspace_wide_diagnostics {
+                cfg.workspace_wide_diagnostics = wide;
             }
             if let Some(languages) = localisation_languages {
                 cfg.loc_languages = languages;
@@ -1221,7 +1239,7 @@ impl Backend {
         // text, so they need the same serialized full scan as startup. A scan
         // already in progress may have passed its loc phase; queue one behind
         // it instead of racing a second rebuild.
-        if ignore_changed || localisation_changed || hover_all_changed {
+        if ignore_changed || localisation_changed || hover_all_changed || workspace_wide_changed {
             if !self.validate_entire_workspace(false).await {
                 self.spawn_deferred_revalidation("didChangeConfiguration");
             }
@@ -1294,6 +1312,12 @@ impl Backend {
             // server reports honestly instead of spinning.
             // User-triggered re-index (no cache purge, unlike clearAllCaches).
             "reindexWorkspace" => self.reindex_workspace_command(token).await,
+            // Run a full workspace validation and return a summary:
+            // total files, files with errors, and counts by severity. The scan
+            // respects the current `workspaceWideDiagnostics` setting, so the
+            // summary is always complete even when the Problems panel is
+            // capped.
+            "validateWorkspace" => self.validate_workspace_command(token).await,
             // `getGraphData(entityType, depth)` — the entity graph the webview
             // renders. See `graph.rs` for the wire format and the bounds.
             "getGraphData" => self.get_graph_data(&params.arguments).await,
@@ -1322,6 +1346,14 @@ impl Backend {
                 .set_vanilla_names(Vec::new());
         }
         self.bump_info_revision();
+    }
+
+    /// Reset per-scan state that ties diagnostics to the current workspace
+    /// snapshot. Called by operations that invalidate the existing index so
+    /// the next scan does not try to clear URIs from a previous workspace.
+    fn reset_scan_publication_state(&self) {
+        *self.state.last_scan_summary.lock() = None;
+        self.state.published_workspace_uris.lock().clear();
     }
 
     /// `cacheVanilla`: re-index the base-game install and re-write the vanilla
@@ -1393,6 +1425,7 @@ impl Backend {
         // re-index rebuilds it the server resolves no base-game reference, so
         // the window a cancel could strand it in is as narrow as it can be.
         self.clear_vanilla_state();
+        self.reset_scan_publication_state();
         // A `Busy` scan (e.g. the periodic background pass) started before this
         // purge and may already be past its vanilla-index phase, so it can't be
         // trusted to rebuild what we just dropped — retry until we win the CAS
@@ -1547,6 +1580,67 @@ impl Backend {
         .to_string();
         progress.finish(Some(msg.clone())).await;
         Ok(Some(Value::String(msg)))
+    }
+
+    /// `validateWorkspace`: run a full workspace validation under a cancellable
+    /// progress token and return a JSON summary. Retries the same way
+    /// `reindexWorkspace` does if another scan holds the guard.
+    async fn validate_workspace_command(
+        &self,
+        token: Option<ProgressToken>,
+    ) -> Result<Option<Value>> {
+        let progress = CommandProgress::begin(
+            self,
+            token,
+            cwtools_i18n::t(cwtools_i18n::Key::CommandValidateWorkspace),
+            true,
+        )
+        .await;
+        let deadline = std::time::Instant::now()
+            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_millis,
+                );
+        let mut outcome = self
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        while outcome == ScanOutcome::Busy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if progress.is_cancelled() {
+                outcome = ScanOutcome::Cancelled;
+                break;
+            }
+            outcome = self
+                .validate_entire_workspace_tracked(false, Some(&progress))
+                .await;
+        }
+
+        let value = match outcome {
+            ScanOutcome::Cancelled => serde_json::json!({ "cancelled": true }),
+            ScanOutcome::Busy => serde_json::json!({ "busy": true }),
+            ScanOutcome::Ran => {
+                let summary = self.state.last_scan_summary.lock().clone();
+                match summary {
+                    Some(s) => serde_json::json!({
+                        "totalFiles": s.total_files,
+                        "validatedFiles": s.validated_files,
+                        "filesWithErrors": s.files_with_errors,
+                        "totalErrors": s.total_errors,
+                        "totalWarnings": s.total_warnings,
+                        "totalInfos": s.total_infos,
+                        "totalHints": s.total_hints,
+                    }),
+                    None => serde_json::json!({
+                        "message": "workspace validation did not complete",
+                    }),
+                }
+            }
+        };
+        progress.finish(None).await;
+        Ok(Some(value))
     }
 
     /// Aggregate every `## required` localisation key that no loc file provides

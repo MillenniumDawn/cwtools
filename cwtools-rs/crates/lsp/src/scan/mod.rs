@@ -19,6 +19,22 @@ mod workspace;
 
 pub(crate) use vanilla::{VanillaLoc, VanillaLocKey};
 
+/// Aggregate counts captured from a completed workspace validation pass,
+/// returned by the `validateWorkspace` execute command and stored so later
+/// callers can read the last result without re-running the scan.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScanSummary {
+    /// Total workspace files discovered on disk this pass.
+    pub total_files: usize,
+    /// Files that were validated (closed files in the scan's result set).
+    pub validated_files: usize,
+    pub files_with_errors: usize,
+    pub total_errors: usize,
+    pub total_warnings: usize,
+    pub total_infos: usize,
+    pub total_hints: usize,
+}
+
 /// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
 /// Fixed (not a sliding reset) so a continuous churn stream still drains.
 const WATCHED_DEBOUNCE_MS: u64 = 500;

@@ -15,6 +15,8 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::references;
 
+use crate::scan::ScanSummary;
+
 pub(crate) type LocTextMap = FxHashMap<Arc<str>, Vec<(cwtools_localization::Lang, String)>>;
 pub(crate) type LocLocationMap = FxHashMap<Arc<str>, (Arc<str>, u32)>;
 
@@ -158,6 +160,12 @@ pub(crate) struct Config {
     /// `CWTOOLS_REINDEX_IDLE_SECS` test override wins over this value. A live
     /// change applies on the next reindex cycle.
     pub(crate) background_reindex_idle_seconds: u64,
+    /// Whether the scan publishes diagnostics for closed workspace files.
+    /// Default `true` so a mod author's Problems panel stays up to date; set
+    /// to `false` to limit diagnostics to open documents only (the old
+    /// behaviour). Sourced from `workspaceWideDiagnostics` in
+    /// `initializationOptions` and `workspace/didChangeConfiguration`.
+    pub(crate) workspace_wide_diagnostics: bool,
     /// Position encoding negotiated with the client. LSP defaults to UTF-16.
     pub(crate) position_encoding: tower_lsp::lsp_types::PositionEncodingKind,
 }
@@ -183,6 +191,7 @@ impl Config {
             var_checks,
             background_reindex_interval_minutes: 0,
             background_reindex_idle_seconds: 15,
+            workspace_wide_diagnostics: true,
             position_encoding: tower_lsp::lsp_types::PositionEncodingKind::UTF16,
         }
     }
@@ -634,6 +643,15 @@ pub(crate) struct DocumentState {
     /// (its payload carries no span edits, see `SuggestedFix::create_loc_key`) —
     /// `genlocall` covers mass stub generation instead.
     pub(crate) fixable_edits: Mutex<HashMap<String, FixableEdits>>,
+    /// Summary captured from the most recent completed workspace scan:
+    /// total files validated, files carrying an error, and counts by severity.
+    /// Updated only after a successful pass so a `validateWorkspace` command
+    /// can return a result without re-running the scan again.
+    pub(crate) last_scan_summary: Mutex<Option<ScanSummary>>,
+    /// Closed workspace files whose diagnostics were last published by the
+    /// scan. Used to clear stale entries when a file is deleted, ignored, or
+    /// pushed off the closed-file diagnostic budget on a later scan.
+    pub(crate) published_workspace_uris: Mutex<HashSet<String>>,
 }
 
 /// Write access to a loc overlay that bumps `loc_overlay_revision` on drop,
@@ -1022,6 +1040,8 @@ impl DocumentState {
             semantic_tokens_cache: Mutex::new(HashMap::new()),
             semantic_tokens_seq: AtomicU64::new(0),
             fixable_edits: Mutex::new(HashMap::new()),
+            last_scan_summary: Mutex::new(None),
+            published_workspace_uris: Mutex::new(HashSet::new()),
         }
     }
 
