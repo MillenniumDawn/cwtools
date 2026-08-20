@@ -1746,4 +1746,53 @@ mod tests {
         idx.value_set_values.remove_file("file://a.txt");
         assert!(snap.value_set_values.contains("character_token", "tok_a"));
     }
+
+    /// Workspace scan pass 2 validates against a *clone* of the live index and
+    /// reads `instances_in_file` off that clone for the unused-instance pass,
+    /// long after an edit may have merged or removed files in the live one. The
+    /// clone has to keep answering with the view it was taken from.
+    ///
+    /// `remove_file` is the sharp case, because it compacts the shared type vec
+    /// by swapping tail entries into the freed slots and rewriting the displaced
+    /// file's positions. A clone that aliased `map` or `file_positions` would
+    /// not merely lose an instance: it would read a surviving file's positions
+    /// against a compacted vec and hand back somebody else's (#328).
+    #[test]
+    fn clone_instances_in_file_is_a_snapshot_of_the_live_index() {
+        let mut idx = TypeIndex::new();
+        for f in 0..4 {
+            let instances = (0..3).map(|n| inst(&format!("f{f}_s{n}"), n)).collect();
+            idx.merge(
+                &format!("file://f{f}.txt"),
+                HashMap::from([("state".to_string(), instances)]),
+            );
+        }
+        let snap = idx.clone();
+        let names = |idx: &TypeIndex, uri: &str| -> Vec<String> {
+            let mut got: Vec<String> = idx
+                .instances_in_file(uri)
+                .into_iter()
+                .map(|(_, i)| i.name.clone())
+                .collect();
+            got.sort();
+            got
+        };
+
+        // Removing f0 drains the vec's tail (f3's entries) into the freed slots.
+        idx.remove_file("file://f0.txt");
+        idx.merge(
+            "file://f9.txt",
+            HashMap::from([("state".to_string(), vec![inst("f9_s0", 0)])]),
+        );
+
+        for f in 0..4 {
+            assert_eq!(
+                names(&snap, &format!("file://f{f}.txt")),
+                vec![format!("f{f}_s0"), format!("f{f}_s1"), format!("f{f}_s2")],
+                "snapshot answered for f{f} from the live index"
+            );
+        }
+        assert!(snap.instances_in_file("file://f9.txt").is_empty());
+        assert!(names(&idx, "file://f0.txt").is_empty());
+    }
 }

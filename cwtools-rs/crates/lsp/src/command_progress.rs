@@ -47,6 +47,13 @@ impl CancelFlag {
         Self(None)
     }
 
+    /// An already-latched flag, for tests that need to drive a cancel path
+    /// without standing up a `CommandProgress` and a client token.
+    #[cfg(test)]
+    pub(crate) fn cancelled_for_tests() -> Self {
+        Self(Some(Arc::new(AtomicBool::new(true))))
+    }
+
     /// `Relaxed` throughout: this is a one-way false→true latch used to stop
     /// doing more work, never to publish data. The worst a stale read costs is
     /// one more file parsed before the next check sees it.
