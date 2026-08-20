@@ -801,7 +801,7 @@ impl Backend {
             game,
             &info_guard.type_index,
             modifier_keys,
-            loc_guard.as_ref(),
+            loc_guard.as_deref(),
             Some(&overlay),
             registry,
             scope_checks,
@@ -877,7 +877,7 @@ impl Backend {
             game,
             &info_guard.type_index,
             &rules_guard.modifier_keys,
-            loc_guard.as_ref(),
+            loc_guard.as_deref(),
             None,
             rules_guard.scope_registry.as_ref(),
             scope_checks,
@@ -1378,7 +1378,7 @@ impl Backend {
                     let display = crate::paths::loc_display_text(&entry.desc);
                     if !display.is_empty() {
                         let key = loc_index
-                            .as_ref()
+                            .as_deref()
                             .and_then(|index| index.key(&entry.key))
                             .unwrap_or_else(|| Arc::from(entry.key.to_lowercase()));
                         new_entries
@@ -1490,7 +1490,7 @@ impl Backend {
         let loc_guard = self.state.loc_index.read();
         let empty_union = cwtools_localization::LocKeySet::default();
         let union: &cwtools_localization::LocKeySet = loc_guard
-            .as_ref()
+            .as_deref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
         cwtools_localization::validate_parsed_loc_files(files, path, union, extra)
@@ -1781,7 +1781,7 @@ impl Backend {
                         game,
                         type_index,
                         &rules_guard.modifier_keys,
-                        loc_guard.as_ref(),
+                        loc_guard.as_deref(),
                         Some(&overlay),
                         rules_guard.scope_registry.as_ref(),
                         scope_checks,

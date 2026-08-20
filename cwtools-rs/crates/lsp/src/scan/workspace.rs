@@ -786,7 +786,7 @@ impl Backend {
                 scan_game,
                 &type_index_snap,
                 &modifier_keys_snap,
-                loc_index_snap.as_ref(),
+                loc_index_snap.as_deref(),
                 None,
                 registry,
                 scope_checks,
@@ -1012,7 +1012,7 @@ impl Backend {
                 .state
                 .loc_index
                 .read()
-                .as_ref()
+                .as_deref()
                 .map(|i| i.union().len())
                 .unwrap_or(0);
             tracing::info!(target: "cwtools::profile", "{}", info_summary);

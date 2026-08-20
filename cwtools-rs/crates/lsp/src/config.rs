@@ -1572,7 +1572,7 @@ impl Backend {
         let loc_guard = self.state.loc_index.read();
         // Before the loc index is built every key looks missing; bail so the
         // command never dumps the entire mod's key set as "missing".
-        let Some(loc) = loc_guard.as_ref().filter(|l| !l.union().is_empty()) else {
+        let Some(loc) = loc_guard.as_deref().filter(|l| !l.union().is_empty()) else {
             return Vec::new();
         };
         let exists = |key: &str| loc.exists_any(key) || overlay.contains(key);
