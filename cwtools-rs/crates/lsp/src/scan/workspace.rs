@@ -767,9 +767,16 @@ impl Backend {
         // Snapshot indexes under brief read guards so rayon holds no
         // `info_service`/`loc_index` locks; a keystroke needing `write()` no
         // longer blocks for the whole pass (pointer-swap shape, yield between
-        // chunks for cancel/progress on large mods).
+        // chunks for cancel/progress on large mods). Clone is O(instances) but
+        // holds the read guard only for the deep copy (~ms vs seconds).
         let type_index_snap = self.state.info_service.read().type_index.clone();
         let loc_index_snap = self.state.loc_index.read().clone();
+        // Parallel vectors built lock-step in the index phase; chunks().zip()
+        // truncates to shortest on mismatch — fail-fast in debug so a length
+        // invariant bug surfaces instead of silently dropping diagnostics.
+        debug_assert_eq!(scan_files.len(), parsed_files.len());
+        debug_assert_eq!(scan_files.len(), source_hashes.len());
+        debug_assert_eq!(scan_files.len(), inline_ignores.len());
         let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
         let registry = scan_registry.as_ref();
         let prepared = scan_ruleset.as_ref().map(|ruleset| {
@@ -810,10 +817,15 @@ impl Backend {
                         return None;
                     }
                     validate_ticker.tick();
+                    // Skip files that failed to parse in pass 1, and open docs
+                    // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
                     if open_uris.contains(&file.uri) {
                         return None;
                     }
+                    // Workspace scan covers files not open in an editor, so
+                    // no line info — cheap single-char range at parser column;
+                    // did_open republishes the precise range.
                     let no_lines = DocLines::none();
                     let (diagnostics, used) = match &prepared {
                         Some(prepared) => validate_parsed_with_indexes(

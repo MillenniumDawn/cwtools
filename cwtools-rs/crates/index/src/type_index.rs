@@ -1615,7 +1615,60 @@ mod tests {
     }
 
     #[test]
-    fn clone_is_independent() {
+    fn clone_file_index_is_independent() {
+        let mut idx = TypeIndex::new();
+        idx.file_index.insert("gfx/a.dds");
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.file_index.insert("gfx/b.dds");
+        assert!(!idx.file_index.contains("gfx/b.dds"));
+        assert!(mutated.file_index.contains("gfx/b.dds"));
+    }
+
+    #[test]
+    fn clone_file_index_exact_case_is_independent() {
+        let mut idx = TypeIndex::new();
+        idx.file_index.set_case_sensitive(true);
+        idx.file_index.insert("gfx/a.dds");
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.file_index.insert("gfx/B.dds");
+        assert!(!idx.file_index.contains("gfx/B.dds"));
+        assert!(mutated.file_index.contains("gfx/B.dds"));
+        // exact-case map must not alias
+        assert_eq!(idx.file_index.on_disk_case("gfx/a.dds"), None);
+        assert!(snap.file_index.contains("gfx/a.dds"));
+    }
+
+    #[test]
+    fn clone_var_index_is_independent() {
+        let mut idx = TypeIndex::new();
+        idx.var_index.add_name("My_Var");
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.var_index.add_name("Other_Var");
+        assert!(!idx.var_index.contains("other_var"));
+        assert!(mutated.var_index.contains("other_var"));
+    }
+
+    #[test]
+    fn clone_var_index_vanilla_is_independent() {
+        let mut idx = TypeIndex::new();
+        idx.var_index
+            .set_vanilla_names(vec!["Vanilla_Var".to_string()]);
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated
+            .var_index
+            .set_vanilla_names(vec!["Other_Vanilla".to_string()]);
+        assert!(mutated.var_index.contains("other_vanilla"));
+        assert!(snap.var_index.contains("vanilla_var"));
+        assert!(!snap.var_index.contains("other_vanilla"));
+        assert!(!idx.var_index.contains("other_vanilla"));
+    }
+
+    #[test]
+    fn clone_remove_file_is_independent() {
         let mut idx = TypeIndex::new();
         idx.merge(
             "file://a.txt",
@@ -1625,24 +1678,14 @@ mod tests {
             "file://b.txt",
             HashMap::from([("event".to_string(), vec![inst("ev_b", 2)])]),
         );
-        idx.file_index.insert("gfx/a.dds");
-        idx.var_index.add_name("My_Var");
         let snap = idx.clone();
-        // Mutate clone, original must not see the mutation.
         let mut mutated = snap.clone();
         mutated.merge(
             "file://c.txt",
             HashMap::from([("event".to_string(), vec![inst("ev_c", 3)])]),
         );
-        mutated.file_index.insert("gfx/b.dds");
-        mutated.var_index.add_name("Other_Var");
         assert!(!idx.contains("event", "ev_c"));
-        assert!(!idx.file_index.contains("gfx/b.dds"));
-        assert!(!idx.var_index.contains("other_var"));
         assert!(mutated.contains("event", "ev_c"));
-        assert!(mutated.file_index.contains("gfx/b.dds"));
-        assert!(mutated.var_index.contains("other_var"));
-        // Mutate original via remove_file, clone must retain removed entry.
         let snap2 = idx.clone();
         idx.remove_file("file://a.txt");
         assert!(!idx.contains("event", "ev_a"));

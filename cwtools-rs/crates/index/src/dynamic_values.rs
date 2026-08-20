@@ -593,4 +593,29 @@ alias[effect:generate_character] = {
         assert!(!idx.contains("country_flag", "a_flag"));
         assert!(snap.contains("country_flag", "a_flag"));
     }
+
+    #[test]
+    fn clone_multi_namespace_is_independent() {
+        let mut idx = NamedValueIndex::new();
+        idx.merge_file(
+            "a.txt",
+            HashMap::from([
+                ("country_flag".to_string(), vec!["a_flag".to_string()]),
+                ("global_flag".to_string(), vec!["g_flag".to_string()]),
+            ]),
+        );
+        let snap = idx.clone();
+        let mut mutated = snap.clone();
+        mutated.merge_file(
+            "b.txt",
+            HashMap::from([("country_flag".to_string(), vec!["b_flag".to_string()])]),
+        );
+        assert!(!idx.contains("country_flag", "b_flag"));
+        assert!(mutated.contains("country_flag", "b_flag"));
+        assert!(snap.contains("global_flag", "g_flag"));
+        // export() must not alias
+        let snap_export = snap.export();
+        let idx_export = idx.export();
+        assert_eq!(snap_export.len(), idx_export.len());
+    }
 }
