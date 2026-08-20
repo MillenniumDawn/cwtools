@@ -1284,7 +1284,9 @@ fn index_game_dir_with_cache(
 /// heuristic in `search_config_for`: a mod root with loose .txt files at the
 /// top level (Changelog.txt etc.) would otherwise be scanned whole-tree,
 /// pulling in non-script dirs the config never asks for.
-pub fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) {
+///
+/// Crate-local: callers should use [`workspace_discovery_config`] instead.
+pub(crate) fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) {
     if folders.is_empty() {
         return;
     }
@@ -1295,7 +1297,9 @@ pub fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) 
 
 /// Build the `FileManagerConfig` the workspace scan should use, narrowed to the
 /// ruleset's `folders` (via [`apply_config_folders`]) and, for a multi-mod
-/// workspace, overridden to exactly the ruleset's folders. Shared by the CLI
+/// workspace, overridden **unconditionally** to exactly the ruleset's folders
+/// (bypassing the `root.contains(folder)` check, since a `MultipleMod`
+/// workspace root lacks the game folders themselves). Shared by the CLI
 /// ([`Session::load`]) and the LSP so `cwtools validate` and the editor
 /// discover the same file set (#284).
 pub fn workspace_discovery_config(root: &Path, ruleset: Option<&RuleSet>) -> FileManagerConfig {
@@ -1312,9 +1316,18 @@ pub fn workspace_discovery_config(root: &Path, ruleset: Option<&RuleSet>) -> Fil
 /// Discover the workspace's script files using a fully-built config (typically
 /// from [`workspace_discovery_config`]). Handles both single-mod and multi-mod
 /// workspaces, so the CLI and LSP share one branching point (#284).
+///
+/// This does not need a `StringTable`: discovery only filters paths by
+/// `include_dirs` / globs / `FileKind::Script` and builds `logical_path`.
+/// Parsing with a shared table happens later in `Session` / the LSP indexer.
 pub fn discover_workspace_files(
     config: FileManagerConfig,
 ) -> Result<Vec<DiscoveredFile>, FileError> {
+    // `workspace_discovery_config` already called `classify_directory` for the
+    // multi-mod `include_dirs` override. Re-classifying here costs one extra
+    // stat (two `read_dir` checks) but keeps `discover_workspace_files` usable
+    // standalone without a precomputed flag. TOCTOU between the two calls is
+    // acceptable: a racing `mod/` creation would only affect the next scan.
     let is_multi_mod = classify_directory(&config.root) == DirectoryType::MultipleMod;
     let manager = FileManager::new(config);
     if is_multi_mod {

@@ -965,6 +965,7 @@ fn collect_files_recursive(
 /// replace, the engine baseline). Each directory's entries are sorted, so the
 /// traversal order is deterministic and independent of the filesystem's
 /// `read_dir` order.
+#[deprecated(note = "use cwtools_driver::{workspace_discovery_config, discover_workspace_files}")]
 pub fn walk_workspace_files(
     root: &Path,
     extensions: &[&str],
@@ -1382,6 +1383,7 @@ fn glob_greedy(p: &[char], t: &[char]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
