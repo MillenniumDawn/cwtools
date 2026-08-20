@@ -1,3 +1,5 @@
+#[cfg(test)]
+use parking_lot::Condvar;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +17,70 @@ use cwtools_validation::references;
 
 pub(crate) type LocTextMap = FxHashMap<Arc<str>, Vec<(cwtools_localization::Lang, String)>>;
 pub(crate) type LocLocationMap = FxHashMap<Arc<str>, (Arc<str>, u32)>;
+
+/// Where a pass-2 cancel test latches the flag. `After` is after extend,
+/// before `yield_now`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass2HoldPoint {
+    Before,
+    Mid,
+    After,
+}
+
+/// First matching caller parks; later Mid workers skip so a partial chunk can
+/// finish.
+#[cfg(test)]
+pub(crate) struct Pass2Gate {
+    hold_at: Pass2HoldPoint,
+    state: Mutex<Pass2GateState>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+struct Pass2GateState {
+    arrived: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl Pass2Gate {
+    pub(crate) fn new(hold_at: Pass2HoldPoint) -> Arc<Self> {
+        Arc::new(Self {
+            hold_at,
+            state: Mutex::new(Pass2GateState {
+                arrived: false,
+                released: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn hold(&self, point: Pass2HoldPoint) {
+        if self.hold_at != point {
+            return;
+        }
+        let mut st = self.state.lock();
+        if st.arrived {
+            return;
+        }
+        st.arrived = true;
+        self.cv.notify_all();
+        while !st.released {
+            self.cv.wait(&mut st);
+        }
+    }
+
+    pub(crate) fn has_arrived(&self) -> bool {
+        self.state.lock().arrived
+    }
+
+    pub(crate) fn release(&self) {
+        let mut st = self.state.lock();
+        st.released = true;
+        self.cv.notify_all();
+    }
+}
 
 /// Settings group: values set once at `initialize` / `didChangeConfiguration`
 /// and only read (clone-and-drop) everywhere else. Held behind a single
@@ -511,6 +577,9 @@ pub(crate) struct DocumentState {
     /// matches this short-circuits the whole reindex. `None` until the first
     /// pass; never stored for an empty walk (a transiently-unreadable root).
     pub(crate) last_scan_fingerprint: parking_lot::Mutex<Option<(u64, u64)>>,
+    /// Pass-2 cancel tests park here. Production never installs one.
+    #[cfg(test)]
+    pub(crate) pass2_gate: parking_lot::Mutex<Option<Arc<Pass2Gate>>>,
     /// Bumped whenever a rules or config change could alter validation output,
     /// folded into `last_scan_fingerprint` so such a change forces the next
     /// quiet pass to run. `SeqCst`: rare writer, single reader, so ordering
@@ -937,6 +1006,8 @@ impl DocumentState {
             last_loc_signature: parking_lot::Mutex::new(None),
             loc_discovery_cache: parking_lot::Mutex::new(None),
             last_scan_fingerprint: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            pass2_gate: parking_lot::Mutex::new(None),
             settings_generation: AtomicU64::new(0),
             start: std::time::Instant::now(),
             last_activity_ms: AtomicU64::new(0),
