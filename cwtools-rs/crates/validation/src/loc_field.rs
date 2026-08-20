@@ -208,11 +208,18 @@ fn check_loc_key(
             is_builtin_variable(ruleset, name) || var_index.is_some_and(|v| v.contains(name))
         };
         let lookup: cwtools_localization::ScriptedVariables<'_> = &names_variable;
-        let names_scripted_loc =
-            move |name: &str| type_index.is_some_and(|ti| ti.contains("scripted_loc", name));
+        // Two sources: the ruleset's `scripted_loc` type where its declared path
+        // matches (Stellaris), and the path-driven index where it does not (the
+        // HOI4 config points that type at Stellaris's folder, #348).
+        let names_scripted_loc = move |name: &str| {
+            type_index.is_some_and(|ti| {
+                ti.contains("scripted_loc", name) || ti.scripted_loc_index.contains(name)
+            })
+        };
         let loc_lookup: cwtools_localization::ScriptedVariables<'_> = &names_scripted_loc;
-        let has_scripted_loc =
-            type_index.is_some_and(|ti| !ti.instances("scripted_loc").is_empty());
+        let has_scripted_loc = type_index.is_some_and(|ti| {
+            !ti.instances("scripted_loc").is_empty() || !ti.scripted_loc_index.is_empty()
+        });
         let data = cwtools_localization::LocScopeData {
             game,
             terminal_commands: ctx.ruleset.localisation_commands.iter().cloned().collect(),

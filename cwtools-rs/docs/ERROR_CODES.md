@@ -289,6 +289,18 @@ every multi-segment chain stays lenient there. `validate` withholds it the same
 way while its variable index is still empty, which is what the language server
 sees before its first scan finishes.
 
+A chain without the `?` ends in a terminal command or a scripted-localisation
+name, and CW226 and CW266 need a second registry for that half: the
+`defined_text` names the project defines. They are read from the folder
+(`common/scripted_localisation`, or `common/scripted_loc` on the Jomini games)
+rather than through the ruleset's `scripted_loc` type, because the HOI4 config
+declares that type at Stellaris's path and so never matches a HOI4 file (#348).
+The same withholding rule applies: no names, no judgment. Only the two passes
+that walk the game files have them, so `cwtools loc` reports neither code on a
+command tail and keeps CW260 alone, and `validate` is lenient until its scan
+finishes. A base-game install contributes its names too, through the vanilla
+cache.
+
 `cwtools loc` without both settings loads no registry and reports none of the
 three; the file-level loc checks (CW225, CW254-CW259, CW268, CW275, CW276) do
 not need one and always run.

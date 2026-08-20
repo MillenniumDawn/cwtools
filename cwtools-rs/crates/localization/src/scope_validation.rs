@@ -84,8 +84,10 @@ pub struct LocScopeData<'a> {
     pub scripted_variables: Option<ScriptedVariables<'a>>,
     /// Scripted-localisation registry, consulted alongside terminal commands
     /// before CW226 fires. Mirrors `scripted_variables` but for the final
-    /// tail of a command chain (`AST_GetNavyName` etc). `None` keeps the
-    /// check lenient when no type index is available.
+    /// tail of a command chain (`AST_GetNavyName` etc). `None` means the run
+    /// has no scripted-localisation data at all, which leaves every unknown
+    /// tail lenient: nothing can tell a scripted localisation from a typo, and
+    /// calling them all typos is what #348 was.
     pub scripted_locs: Option<ScriptedVariables<'a>>,
 }
 
@@ -361,7 +363,16 @@ fn validate_command_string(
                 // not from validateLocalisationCommandsBase. Legacy commands like
                 // `[var_name|fmt]` or `[2%%Y]` are valid HOI4 loc syntax and are
                 // not scope links, so we remain lenient here.
-                if is_last && !data.terminal_commands.is_empty() && !looks_terminal {
+                //
+                // A bare `[SomeScriptedLoc]` reaches this arm rather than the
+                // Jomini one (no dot to split on), so it is judged against the
+                // same scripted-localisation registry (#348).
+                if is_last
+                    && !data.terminal_commands.is_empty()
+                    && !looks_terminal
+                    && data.scripted_locs.is_some()
+                    && !is_scripted_loc(seg, data)
+                {
                     diags.push(LocCommandDiagnostic::ChainEndsInScope {
                         command: cmd.to_string(),
                     });
@@ -404,6 +415,10 @@ fn validate_jomini_chain(
     let has_q_mark = data.question_mark_variable && marker.is_some();
     let reads_through_variable = has_q_mark && marker.is_some_and(|m| reads_a_variable(m, data));
     let lacks_variable_registry = has_q_mark && data.scripted_variables.is_none();
+    // A chain without the `?` ends in a terminal command or a scripted-localisation
+    // name. With no scripted-localisation registry nothing can tell one from a typo,
+    // so the tail stays lenient rather than reporting every one of them (#348).
+    let lacks_loc_registry = !has_q_mark && data.scripted_locs.is_none();
     let mut had_lenient_intermediate =
         (reads_through_variable || lacks_variable_registry) && chain.len() > 1;
 
@@ -454,6 +469,7 @@ fn validate_jomini_chain(
                     && data.registry.is_some()
                     && !looks_terminal
                     && !had_lenient_intermediate
+                    && !lacks_loc_registry
                     && !reads_a_variable(seg, data)
                     && !is_scripted_loc(seg, data)
                 {
@@ -585,7 +601,10 @@ mod tests {
             parameter_variables: true,
             registry: Some(Arc::new(reg)),
             scripted_variables: None,
-            ..Default::default()
+            // Present but empty: the project defines no scripted localisation, so
+            // an unknown tail really is a typo. `None` would mean "no data", which
+            // is a different answer (see the lenient tests below).
+            scripted_locs: Some(&|_: &str| false),
         }
     }
 
@@ -814,6 +833,72 @@ mod tests {
             diags.is_empty(),
             "without registry, unknown command should be accepted: {:?}",
             diags
+        );
+    }
+
+    // ── #348: no scripted-localisation registry means no judgment ─────────────
+
+    /// The run has a scope registry but no scripted-localisation data (the
+    /// standalone `loc` lint, and the editor before its first scan finishes).
+    /// A tail could be a `defined_text` as easily as a typo, so neither the
+    /// chain path nor the legacy single-segment path may call it one.
+    fn hoi4_data_without_loc_registry() -> LocScopeData<'static> {
+        LocScopeData {
+            scripted_locs: None,
+            ..hoi4_data()
+        }
+    }
+
+    #[test]
+    fn chain_without_scripted_loc_registry_stays_lenient() {
+        let entry = chain(&["Root", "AST_GetNavyName"]);
+        let data = hoi4_data_without_loc_registry();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "no scripted-loc registry must leave the tail unjudged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_command_without_scripted_loc_registry_stays_lenient() {
+        let entry = make_entry_with_commands(vec!["AST_GetNavyName".into()]);
+        let data = hoi4_data_without_loc_registry();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "the legacy path must be lenient too: {diags:?}"
+        );
+    }
+
+    /// A bare `[SomeScriptedLoc]` has no dot to split on, so it reaches
+    /// `validate_command_string` rather than the chain walker. That path judged
+    /// the tail against `terminal_commands` alone and reported CW266 for every
+    /// scripted localisation (#348).
+    #[test]
+    fn bare_scripted_loc_command_is_accepted() {
+        let entry = make_entry_with_commands(vec!["AST_GetNavyName".into()]);
+        let mut data = hoi4_data();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a bare scripted-localisation command must be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_unknown_command_still_ends_in_scope() {
+        // The other half: with the registry present, a name it does not know is
+        // still reported, so the check keeps catching real mistakes.
+        let entry = make_entry_with_commands(vec!["Receiving Country".into()]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert_eq!(
+            diags,
+            vec![LocCommandDiagnostic::ChainEndsInScope {
+                command: "Receiving Country".into(),
+            }],
         );
     }
 

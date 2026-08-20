@@ -141,6 +141,7 @@ impl Backend {
             var_names,
             complex_enum_values,
             value_set_values,
+            scripted_loc_names,
         } = aux;
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
@@ -150,6 +151,7 @@ impl Backend {
         }
         *self.state.vanilla_file_paths.lock() = Some(file_paths);
         *self.state.vanilla_var_names.lock() = Some(var_names);
+        *self.state.vanilla_scripted_loc_names.lock() = Some(scripted_loc_names);
         self.merge_vanilla_dynamic_values(complex_enum_values, value_set_values);
         total
     }
@@ -223,6 +225,15 @@ impl Backend {
         if let Some(var_names) = self.state.vanilla_var_names.lock().clone() {
             let mut info = self.state.info_service.write();
             info.type_index.var_index.set_vanilla_names(var_names);
+            drop(info);
+            self.bump_info_revision();
+        }
+
+        // Base-game scripted localisations, same provenance split: a loc command
+        // naming one must resolve without the mod having to define it (#348).
+        if let Some(names) = self.state.vanilla_scripted_loc_names.lock().clone() {
+            let mut info = self.state.info_service.write();
+            info.type_index.scripted_loc_index.set_vanilla_names(names);
             drop(info);
             self.bump_info_revision();
         }
@@ -543,6 +554,7 @@ mod tests {
                 var_names: var_names.into_iter().map(|s| s.to_string()).collect(),
                 complex_enum_values: Vec::new(),
                 value_set_values: Vec::new(),
+                scripted_loc_names: Vec::new(),
             },
         }
     }
