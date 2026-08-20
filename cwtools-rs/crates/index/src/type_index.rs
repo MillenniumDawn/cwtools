@@ -509,7 +509,11 @@ pub struct TypeIndex {
     /// e.g. `equipment_stat`, `country_tags`, `idea_name`. Completion-only.
     pub complex_enum_values: dynamic_values::NamedValueIndex,
     /// `value_set[...]` members collected from indexed files (namespace ->
-    /// values), e.g. `country_flag`, `global_flag`. Completion-only.
+    /// values), e.g. `country_flag`, `global_flag`. Feeds completion, and also
+    /// validation: a `from_data` scope link with `data_source = value[<set>]`
+    /// makes any member of that set a scope-opening key, so dropping this from
+    /// an index the rule engine reads moves diagnostics
+    /// (`validation::rule_core::matching::is_from_data_value_set_member`).
     pub value_set_values: dynamic_values::NamedValueIndex,
 }
 
