@@ -13,7 +13,7 @@ use cwtools_validation::validate_prepared_tracking_uses;
 
 use crate::Backend;
 use crate::command_progress::{
-    CommandProgress, Phase, ScanOutcome, cancel_flag_of, phase_percentage, start_phase,
+    CancelFlag, CommandProgress, Phase, ScanOutcome, cancel_flag_of, phase_percentage, start_phase,
 };
 use crate::paths::{logical_path_from_uri, path_to_uri, uri_to_path_str};
 use crate::validate::{
@@ -33,6 +33,85 @@ use super::{
 const PASS2_CHUNK_SIZE: usize = 256;
 #[cfg(test)]
 const PASS2_CHUNK_SIZE: usize = 2;
+
+/// Map four lock-step slices in parallel, `chunk` elements at a time, yielding
+/// to the runtime between chunks so a long scan stays cancellable and the
+/// progress bar keeps moving.
+///
+/// The result is the concatenation of the per-chunk results in input order, so
+/// it is identical for every `chunk` size. Chunking is a scheduling knob, not
+/// behavioral, which the parity tests below pin (#328).
+///
+/// `None` means `cancel` latched. A cancelled walk must not hand back the
+/// partial `Vec` it had built: pass 2's callers read a short result as "these
+/// files have nothing in them" and would publish empty diagnostics over files
+/// that were never validated.
+///
+/// The four slices have to be the same length. `chunks().zip()` truncates to
+/// the shortest, so a lock-step bug would silently drop the tail; assert
+/// instead, and let the invariant fail loudly at the boundary it belongs to.
+struct ChunkMapper<F, Before, After> {
+    map: F,
+    before_chunk: Before,
+    after_chunk: After,
+}
+
+async fn chunked_par_filter_map<A, B, C, D, R, F, Before, After>(
+    first: &[A],
+    second: &[B],
+    third: &[C],
+    fourth: &[D],
+    chunk: usize,
+    cancel: &CancelFlag,
+    mapper: ChunkMapper<F, Before, After>,
+) -> Option<Vec<R>>
+where
+    A: Sync,
+    B: Sync,
+    C: Sync,
+    D: Sync,
+    R: Send,
+    F: Fn(&A, &B, &C, &D) -> Option<R> + Send + Sync,
+    Before: Fn(),
+    After: Fn(),
+{
+    use rayon::prelude::*;
+
+    let ChunkMapper {
+        map,
+        before_chunk,
+        after_chunk,
+    } = mapper;
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first.len(), third.len());
+    assert_eq!(first.len(), fourth.len());
+    let mut out: Vec<R> = Vec::with_capacity(first.len());
+    for (((a, b), c), d) in first
+        .chunks(chunk)
+        .zip(second.chunks(chunk))
+        .zip(third.chunks(chunk))
+        .zip(fourth.chunks(chunk))
+    {
+        before_chunk();
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let mapped: Vec<R> = a
+            .par_iter()
+            .zip(b.par_iter())
+            .zip(c.par_iter())
+            .zip(d.par_iter())
+            .filter_map(|(((a, b), c), d)| map(a, b, c, d))
+            .collect();
+        out.extend(mapped);
+        after_chunk();
+        tokio::task::yield_now().await;
+        if cancel.is_cancelled() {
+            return None;
+        }
+    }
+    Some(out)
+}
 
 impl Backend {
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
@@ -801,28 +880,19 @@ impl Backend {
                 var_checks,
             )
         });
-        let mut chunked_results: Vec<ValidationOutcome> = Vec::with_capacity(scan_files.len());
-        for ((files_chunk, parsed_chunk), (hashes_chunk, ignores_chunk)) in scan_files
-            .chunks(PASS2_CHUNK_SIZE)
-            .zip(parsed_files.chunks(PASS2_CHUNK_SIZE))
-            .zip(
-                source_hashes
-                    .chunks(PASS2_CHUNK_SIZE)
-                    .zip(inline_ignores.chunks(PASS2_CHUNK_SIZE)),
-            )
-        {
-            #[cfg(test)]
-            self.hold_pass2(crate::state::Pass2HoldPoint::Before);
-            if cancel.is_cancelled() {
-                validate_ticker.stop();
-                return false;
-            }
-            let chunk_results: Vec<ValidationOutcome> = files_chunk
-                .par_iter()
-                .zip(parsed_chunk.par_iter())
-                .zip(hashes_chunk.par_iter())
-                .zip(ignores_chunk.par_iter())
-                .filter_map(|(((file, parsed_opt), source_hash), inline_ignored)| {
+        // Parallel vectors built lock-step in the index phase.
+        let Some(mut results): Option<Vec<ValidationOutcome>> = chunked_par_filter_map(
+            &scan_files,
+            &parsed_files,
+            &source_hashes,
+            &inline_ignores,
+            PASS2_CHUNK_SIZE,
+            &cancel,
+            ChunkMapper {
+                map: |file: &ScannedFile,
+                      parsed_opt: &Option<cwtools_parser::ast::ParsedFile>,
+                      source_hash: &Option<u64>,
+                      inline_ignored: &InlineIgnoreMap| {
                     #[cfg(test)]
                     self.hold_pass2(crate::state::Pass2HoldPoint::Mid);
                     if cancel.is_cancelled() {
@@ -859,18 +929,22 @@ impl Backend {
                         *source_hash,
                         inline_ignored.clone(),
                     ))
-                })
-                .collect();
-            chunked_results.extend(chunk_results);
-            #[cfg(test)]
-            self.hold_pass2(crate::state::Pass2HoldPoint::After);
-            tokio::task::yield_now().await;
-            if cancel.is_cancelled() {
-                validate_ticker.stop();
-                return false;
-            }
-        }
-        let mut results: Vec<ValidationOutcome> = chunked_results;
+                },
+                before_chunk: || {
+                    #[cfg(test)]
+                    self.hold_pass2(crate::state::Pass2HoldPoint::Before);
+                },
+                after_chunk: || {
+                    #[cfg(test)]
+                    self.hold_pass2(crate::state::Pass2HoldPoint::After);
+                },
+            },
+        )
+        .await
+        else {
+            validate_ticker.stop();
+            return false;
+        };
         // Unused-instance second phase: same global merge as before, but against
         // the snapshot's `type_index_snap` so it doesn't re-acquire the lock.
         // Skipped on cancel: a partial `results` would prune unscanned files.
@@ -1400,5 +1474,137 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_pass2_cancel_between_chunks_skips_merge() {
         run_cancelled_at(Pass2HoldPoint::After).await;
+    }
+
+    type Row = (usize, usize, u64, u32);
+    type Inputs = (Vec<usize>, Vec<Option<usize>>, Vec<Option<u64>>, Vec<u32>);
+
+    /// Four lock-step slices shaped like pass 2's, each carrying a different
+    /// multiple of the index so a walk that misaligned them by even one element
+    /// produces rows that don't match. Every seventh element is a hole, standing
+    /// in for the files pass 2 drops (a failed parse, an open document): the
+    /// walk has to skip them without shifting the rows around them.
+    fn inputs(n: usize) -> Inputs {
+        (
+            (0..n).collect(),
+            (0..n).map(|i| (i % 7 != 3).then_some(i * 2)).collect(),
+            (0..n).map(|i| Some(i as u64 * 3)).collect(),
+            (0..n).map(|i| i as u32 * 7).collect(),
+        )
+    }
+
+    fn take(a: &usize, b: &Option<usize>, c: &Option<u64>, d: &u32) -> Option<Row> {
+        Some((*a, (*b)?, (*c)?, *d))
+    }
+
+    /// What the walk would produce with no chunking and no parallelism at all.
+    fn sequential(a: &[usize], b: &[Option<usize>], c: &[Option<u64>], d: &[u32]) -> Vec<Row> {
+        a.iter()
+            .zip(b)
+            .zip(c)
+            .zip(d)
+            .filter_map(|(((a, b), c), d)| take(a, b, c, d))
+            .collect()
+    }
+
+    async fn walk(n: usize, chunk: usize) -> Option<Vec<Row>> {
+        let (a, b, c, d) = inputs(n);
+        chunked_par_filter_map(
+            &a,
+            &b,
+            &c,
+            &d,
+            chunk,
+            &CancelFlag::inert(),
+            ChunkMapper {
+                map: take,
+                before_chunk: || {},
+                after_chunk: || {},
+            },
+        )
+        .await
+    }
+
+    /// Empty, single, one short of a chunk, exactly a chunk, one past it, the
+    /// 300 the issue asked for, and two full chunks.
+    const SIZES: [usize; 7] = [0, 1, 255, 256, 257, 300, 512];
+
+    #[tokio::test]
+    async fn chunked_walk_matches_unchunked_at_every_boundary() {
+        for n in SIZES {
+            let (a, b, c, d) = inputs(n);
+            let expected = sequential(&a, &b, &c, &d);
+            assert_eq!(
+                walk(n, PASS2_CHUNK_SIZE).await,
+                Some(expected.clone()),
+                "chunked walk of {n} elements"
+            );
+            assert_eq!(
+                walk(n, usize::MAX).await,
+                Some(expected),
+                "single-chunk walk of {n} elements"
+            );
+        }
+    }
+
+    /// The chunk size is a scheduling knob: the result is the same sequence at
+    /// any of them, including sizes that split the input unevenly.
+    #[tokio::test]
+    async fn chunked_walk_is_independent_of_chunk_size() {
+        let unchunked = walk(300, usize::MAX).await;
+        for chunk in [1, 2, 7, 255, 256, 257, 299, 300, 301] {
+            assert_eq!(
+                walk(300, chunk).await,
+                unchunked,
+                "300 elements in chunks of {chunk}"
+            );
+        }
+    }
+
+    /// A cancelled walk hands back nothing, not the chunks it had finished:
+    /// pass 2 publishes what it returns, and a short result would clear
+    /// diagnostics on every file past the cancel.
+    #[tokio::test]
+    async fn cancelled_walk_returns_none_not_a_partial_result() {
+        let (a, b, c, d) = inputs(300);
+        let cancelled = CancelFlag::cancelled_for_tests();
+        let out = chunked_par_filter_map(
+            &a,
+            &b,
+            &c,
+            &d,
+            PASS2_CHUNK_SIZE,
+            &cancelled,
+            ChunkMapper {
+                map: take,
+                before_chunk: || {},
+                after_chunk: || {},
+            },
+        )
+        .await;
+        assert_eq!(out, None);
+    }
+
+    /// Slices out of lock-step must fail loudly. `chunks().zip()` truncates to
+    /// the shortest, so without the assert a length-invariant bug upstream would
+    /// silently drop the tail's diagnostics.
+    #[tokio::test]
+    #[should_panic]
+    async fn mismatched_lengths_panic_rather_than_truncate() {
+        let (a, b, c, d) = inputs(300);
+        let _ = chunked_par_filter_map(
+            &a[..299],
+            &b,
+            &c,
+            &d,
+            PASS2_CHUNK_SIZE,
+            &CancelFlag::inert(),
+            ChunkMapper {
+                map: take,
+                before_chunk: || {},
+                after_chunk: || {},
+            },
+        )
+        .await;
     }
 }

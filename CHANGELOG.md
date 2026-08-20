@@ -23,6 +23,7 @@
 
 - The diagnostic catalog is enumerated once, as `cwtools_error_codes::CATALOG`, instead of being hand-mirrored in the CLI. `crates/cli/src/codes.rs` reads it, and the test that diffed the mirror against the consts moved to `error_codes` beside both.
 - `cargo bench -p cwtools_driver --bench snapshot_clone` times the workspace-scan pass 2 index snapshot, the clone that is the whole `info_service` lock hold, and splits it between the type maps and the two dynamic-value indexes. On Millennium Dawn's 249k instances the clone is 41ms, of which the dynamic-value indexes are about 7%, so the maps are what a future change has to move. Runs against a synthetic index when no corpus checkout is present. (#332)
+- Workspace scan pass 2's chunked walk is now a helper with the chunk size as a parameter, so tests can assert the chunked and unchunked results are the same sequence. They run the boundary sizes (0, 1, 255, 256, 257, 300, 512), every chunk size from 1 up to one big enough to swallow the input, and pin that a cancelled walk returns nothing rather than the chunks it had finished. A companion test pins that `instances_in_file` read off a `TypeIndex` clone still answers from the snapshot after the live index compacts its slots. (#328)
 
 # 2.6.0
 
