@@ -1653,17 +1653,20 @@ fn discover_workspace_files_returns_sorted_order_single_mod() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("modroot");
     std::fs::create_dir_all(root.join("common")).unwrap();
-    for name in ["zebra.txt", "alpha.txt", "middle.txt"] {
+    for name in ["zebra.txt", "middle.txt", "alpha.txt"] {
         std::fs::write(root.join("common").join(name), "x = 1\n").unwrap();
     }
     let rs = ruleset_with_folders(&["common"]);
     let cfg = workspace_discovery_config(&root, Some(&rs));
     let files = discover_workspace_files(cfg).expect("discovery");
     let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
-    let mut sorted = logical.clone();
-    sorted.sort();
     assert_eq!(
-        logical, sorted,
+        logical,
+        vec![
+            "common/alpha.txt".to_string(),
+            "common/middle.txt".to_string(),
+            "common/zebra.txt".to_string()
+        ],
         "single-mod discovery must be sorted: {logical:?}"
     );
 }
@@ -1675,7 +1678,7 @@ fn discover_workspace_files_returns_sorted_order_multi_mod() {
     std::fs::create_dir_all(ws.join("mod")).unwrap();
     std::fs::write(ws.join("mod/a.mod"), "name = \"A Mod\"\npath = \"alpha\"\n").unwrap();
     std::fs::write(ws.join("mod/b.mod"), "name = \"B Mod\"\npath = \"bravo\"\n").unwrap();
-    for p in ["common/zebra.txt", "common/alpha.txt"] {
+    for p in ["common/zebra.txt", "common/middle.txt", "common/alpha.txt"] {
         for m in ["alpha", "bravo"] {
             let path = ws.join(m).join(p);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1686,10 +1689,13 @@ fn discover_workspace_files_returns_sorted_order_multi_mod() {
     let cfg = workspace_discovery_config(&ws, Some(&rs));
     let files = discover_workspace_files(cfg).expect("multi-mod discovery");
     let logical: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
-    let mut sorted = logical.clone();
-    sorted.sort();
     assert_eq!(
-        logical, sorted,
+        logical,
+        vec![
+            "common/alpha.txt".to_string(),
+            "common/middle.txt".to_string(),
+            "common/zebra.txt".to_string()
+        ],
         "multi-mod discovery must be globally sorted: {logical:?}"
     );
 }
@@ -1702,8 +1708,8 @@ fn discover_workspace_files_parity_with_session_preserves_order() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("modroot");
     std::fs::create_dir_all(root.join("common")).unwrap();
-    std::fs::write(root.join("common/a.txt"), "my_a = { }\n").unwrap();
     std::fs::write(root.join("common/b.txt"), "my_b = { }\n").unwrap();
+    std::fs::write(root.join("common/a.txt"), "my_a = { }\n").unwrap();
     std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
     std::fs::write(
         tmp.path().join("rules/f.cwt"),
@@ -1734,6 +1740,15 @@ fn discover_workspace_files_parity_with_session_preserves_order() {
     assert_eq!(
         session_paths, direct_paths,
         "Session and direct discovery must agree on order without sorting"
+    );
+    let expected = vec!["common/a.txt".to_string(), "common/b.txt".to_string()];
+    assert_eq!(
+        session_paths, expected,
+        "discovery must be sorted: {session_paths:?}"
+    );
+    assert_eq!(
+        direct_paths, expected,
+        "discovery must be sorted: {direct_paths:?}"
     );
 }
 
