@@ -441,8 +441,7 @@ impl Session {
 
         // Discover + parse mod files using the SAME string table. Layer the
         // user-supplied ignore globs on top of the engine defaults.
-        let mut fm_config = search_config_for(&directory);
-        apply_config_folders(&mut fm_config, &ruleset.folders);
+        let mut fm_config = workspace_discovery_config(&directory, Some(&ruleset));
         if !ignore_files.is_empty() {
             fm_config
                 .exclude_patterns
@@ -454,26 +453,7 @@ impl Session {
                 .extend(ignore_dirs.iter().cloned());
         }
 
-        // Auto-detect a workspace of mods: a directory that is not itself a mod
-        // root but whose `mod/`(or `mods/`) folder holds `.mod` descriptors. Such
-        // a target expands to every referenced mod, layered by load order
-        // (later-resolved mod wins a shared logical path; `replace_path`
-        // suppresses lower-priority files). A plain single mod root takes the
-        // exact single-root discovery path below, unchanged.
-        let is_multi_mod = classify_directory(&directory) == DirectoryType::MultipleMod;
-        if is_multi_mod && !ruleset.folders.is_empty() {
-            // The workspace root itself lacks the game folders (they live inside
-            // each mod), so `apply_config_folders`' root check never fires. Use the
-            // ruleset's folder layout for the per-mod discovery.
-            fm_config.include_dirs = ruleset.folders.clone();
-        }
-
-        let manager = FileManager::with_string_table(fm_config, rules_table.clone());
-        let discovered = if is_multi_mod {
-            Ok(manager.discover_files_multi_mod())
-        } else {
-            manager.discover_files()
-        };
+        let discovered = discover_workspace_files(fm_config);
         let (files, discovery_failed) = match discovered {
             Ok(files) => (
                 parse_discovered_files(files, &rules_table, parse_cache.as_ref()),
@@ -1304,12 +1284,43 @@ fn index_game_dir_with_cache(
 /// heuristic in `search_config_for`: a mod root with loose .txt files at the
 /// top level (Changelog.txt etc.) would otherwise be scanned whole-tree,
 /// pulling in non-script dirs the config never asks for.
-fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) {
+pub fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) {
     if folders.is_empty() {
         return;
     }
     if folders.iter().any(|f| config.root.join(f).is_dir()) {
         config.include_dirs = folders.to_vec();
+    }
+}
+
+/// Build the `FileManagerConfig` the workspace scan should use, narrowed to the
+/// ruleset's `folders` (via [`apply_config_folders`]) and, for a multi-mod
+/// workspace, overridden to exactly the ruleset's folders. Shared by the CLI
+/// ([`Session::load`]) and the LSP so `cwtools validate` and the editor
+/// discover the same file set (#284).
+pub fn workspace_discovery_config(root: &Path, ruleset: Option<&RuleSet>) -> FileManagerConfig {
+    let mut config = search_config_for(root);
+    if let Some(ruleset) = ruleset {
+        apply_config_folders(&mut config, &ruleset.folders);
+        if classify_directory(root) == DirectoryType::MultipleMod && !ruleset.folders.is_empty() {
+            config.include_dirs = ruleset.folders.clone();
+        }
+    }
+    config
+}
+
+/// Discover the workspace's script files using a fully-built config (typically
+/// from [`workspace_discovery_config`]). Handles both single-mod and multi-mod
+/// workspaces, so the CLI and LSP share one branching point (#284).
+pub fn discover_workspace_files(
+    config: FileManagerConfig,
+) -> Result<Vec<DiscoveredFile>, FileError> {
+    let is_multi_mod = classify_directory(&config.root) == DirectoryType::MultipleMod;
+    let manager = FileManager::new(config);
+    if is_multi_mod {
+        Ok(manager.discover_files_multi_mod())
+    } else {
+        manager.discover_files()
     }
 }
 
