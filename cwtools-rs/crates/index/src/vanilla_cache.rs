@@ -69,7 +69,11 @@ const FILE_EXT: &str = ".cwv";
 // event's `title`), so cached-path hover shows the same localised title as a
 // live vanilla scan instead of falling back to a name-derived key. v10 caches
 // lack it and restore it as `None` (#141).
-const CACHE_VERSION: u8 = 11;
+// v12 adds `scripted_loc_names`, the base game's scripted-localisation names, so
+// a cached run can tell a loc command naming one from a typo. v11 caches lack
+// them, and a mod using a vanilla scripted localisation would flag CW226/CW266
+// on every use (#348).
+const CACHE_VERSION: u8 = 12;
 
 /// Hard caps on a `.cwv` read and on what its body may decompress to. The path
 /// comes from `--vanilla-cache` or an LSP client's `vanillaCache` (#162), so a
@@ -118,6 +122,8 @@ struct VanillaCacheFile {
     complex_enum_values: Vec<(String, Vec<String>)>,
     /// `value_set[...]` members written by vanilla files (namespace -> values).
     value_set_values: Vec<(String, Vec<String>)>,
+    /// Scripted-localisation names defined in vanilla (`ScriptedLocIndex` form).
+    scripted_loc_names: Vec<String>,
 }
 
 /// The non-instance half of the cache payload. Built by whoever walks the
@@ -139,6 +145,8 @@ pub struct VanillaCacheAux {
     pub complex_enum_values: Vec<(String, Vec<String>)>,
     /// `value_set[...]` members (namespace -> values)
     pub value_set_values: Vec<(String, Vec<String>)>,
+    /// scripted-localisation names
+    pub scripted_loc_names: Vec<String>,
 }
 
 /// Everything a loaded cache provides, ready to merge into a session.
@@ -332,6 +340,7 @@ fn write_cache(
         var_names: aux.var_names,
         complex_enum_values: aux.complex_enum_values,
         value_set_values: aux.value_set_values,
+        scripted_loc_names: aux.scripted_loc_names,
     };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).map_err(std::io::Error::other)?;
 
@@ -476,6 +485,7 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
                 var_names: cache.var_names,
                 complex_enum_values: cache.complex_enum_values,
                 value_set_values: cache.value_set_values,
+                scripted_loc_names: cache.scripted_loc_names,
             },
         },
     ))
@@ -618,6 +628,7 @@ mod tests {
             var_names: vec!["my_var".into()],
             complex_enum_values: vec![("equipment_stat".into(), vec!["build_cost_ic".into()])],
             value_set_values: vec![("country_flag".into(), vec!["my_flag".into()])],
+            scripted_loc_names: vec!["getsomevanillaloc".into()],
         };
         assert_eq!(save(&idx, "hoi4", "v1.16.4", &path, aux).unwrap(), 2);
 
@@ -660,6 +671,7 @@ mod tests {
         assert_eq!(loaded.aux.var_names, vec!["my_var"]);
         assert_eq!(loaded.aux.complex_enum_values[0].0, "equipment_stat");
         assert_eq!(loaded.aux.value_set_values[0].0, "country_flag");
+        assert_eq!(loaded.aux.scripted_loc_names, vec!["getsomevanillaloc"]);
 
         let mut idx2 = TypeIndex::new();
         idx2.merge_base_game_with_uris(loaded.per_type);
@@ -840,6 +852,7 @@ mod tests {
             var_names: vec!["my_var".into()],
             complex_enum_values: vec![("equipment_stat".into(), vec!["build_cost_ic".into()])],
             value_set_values: vec![("country_flag".into(), vec!["my_flag".into()])],
+            scripted_loc_names: vec!["getsomevanillaloc".into()],
         };
 
         let tmp = tempfile::tempdir().unwrap();

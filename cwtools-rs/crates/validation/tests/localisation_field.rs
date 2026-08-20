@@ -525,6 +525,97 @@ fn scoped_with_cmds_loc_codes(loc: &str, scripted_locs: &[&str]) -> Vec<String> 
     .collect()
 }
 
+/// As above, but the scripted localisations arrive the way a real run gets them:
+/// collected from a `common/scripted_localisation` file, not injected as
+/// instances of a ruleset type. `SCOPED_WITH_CMDS_CWT` declares no
+/// `type[scripted_loc]` at all — exactly like the HOI4 config, whose one
+/// declaration points at a folder that does not exist there (#348).
+fn loc_codes_with_scripted_loc_file(loc: &str, defs: &str) -> Vec<String> {
+    use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(SCOPED_WITH_CMDS_CWT, &table), &table);
+    let idx = loc_index(&[("a_l_english.yml", loc)]);
+    let mut type_index = cwtools_index::TypeIndex::new();
+    let defs_path = "game/common/scripted_localisation/00_defs.txt";
+    type_index.scripted_loc_index.merge_file(
+        defs_path,
+        cwtools_index::collect_scripted_loc_names(&parse_string(defs, &table), defs_path, &table),
+    );
+    let parsed = parse_string("mytype = {\n name = my_key\n}\n", &table);
+    let registry = build_scope_registry_arc(&ruleset, Some(cwtools_game::constants::Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/mytype/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            type_index: Some(&type_index),
+            modifier_keys: None,
+            loc_index: Some(&idx),
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: true,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+const DEFINED_TEXT: &str = r#"
+defined_text = {
+	name = Western_Autocracy_L
+	text = { localization_key = a_key }
+}
+"#;
+
+#[test]
+fn scripted_loc_from_its_folder_clears_the_chain_command() {
+    let codes = loc_codes_with_scripted_loc_file(
+        "l_english:\n my_key: \"[ROOT.Western_Autocracy_L]\"\n",
+        DEFINED_TEXT,
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "a defined_text used in a chain must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn scripted_loc_from_its_folder_clears_the_bare_command() {
+    let codes = loc_codes_with_scripted_loc_file(
+        "l_english:\n my_key: \"[Western_Autocracy_L]\"\n",
+        DEFINED_TEXT,
+    );
+    assert!(
+        !codes.contains(&"CW266".to_string()),
+        "a defined_text used bare must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn a_typo_beside_a_known_scripted_loc_still_warns() {
+    let chain = loc_codes_with_scripted_loc_file(
+        "l_english:\n my_key: \"[ROOT.Western_Autocracy_Typo]\"\n",
+        DEFINED_TEXT,
+    );
+    assert!(
+        chain.contains(&"CW226".to_string()),
+        "the check stays alive for real mistakes: {chain:?}"
+    );
+    let bare = loc_codes_with_scripted_loc_file(
+        "l_english:\n my_key: \"[Western_Autocracy_Typo]\"\n",
+        DEFINED_TEXT,
+    );
+    assert!(
+        bare.contains(&"CW266".to_string()),
+        "and on the bare path too: {bare:?}"
+    );
+}
+
 #[test]
 fn command_chain_with_terminal_is_clean() {
     let codes = scoped_with_cmds_loc_codes("l_english:\n my_key: \"[ROOT.GetName]\"\n", &[]);
@@ -536,10 +627,25 @@ fn command_chain_with_terminal_is_clean() {
 
 #[test]
 fn command_chain_typo_warns_cw226() {
-    let codes = scoped_with_cmds_loc_codes("l_english:\n my_key: \"[ROOT.TotallyUnknown]\"\n", &[]);
+    let codes = scoped_with_cmds_loc_codes(
+        "l_english:\n my_key: \"[ROOT.TotallyUnknown]\"\n",
+        &["AST_GetNavyName"],
+    );
     assert!(
         codes.contains(&"CW226".to_string()),
         "typo command tail must warn CW226: {codes:?}"
+    );
+}
+
+/// The project defines no scripted localisation the index can see, so an unknown
+/// tail could be one it missed. Judging it a typo is what flagged every HOI4
+/// `defined_text` (#348).
+#[test]
+fn command_chain_typo_is_lenient_without_scripted_locs() {
+    let codes = scoped_with_cmds_loc_codes("l_english:\n my_key: \"[ROOT.TotallyUnknown]\"\n", &[]);
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "no scripted-loc data must leave the tail unjudged: {codes:?}"
     );
 }
 

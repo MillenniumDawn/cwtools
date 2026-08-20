@@ -313,6 +313,49 @@ pub fn collect_type_instances_with_subtypes(
     }
 }
 
+/// Directory segments a game keeps its scripted localisations in: HOI4 spells it
+/// `scripted_localisation` (and tolerates the American spelling), the Jomini
+/// games `scripted_loc`.
+const SCRIPTED_LOC_DIRS: [&str; 3] = [
+    "scripted_localisation",
+    "scripted_localization",
+    "scripted_loc",
+];
+
+/// The scripted-localisation names (`defined_text = { name = X }`) defined in
+/// `file`, or an empty vec when its path is not a scripted-loc folder.
+///
+/// Read straight off the file rather than through a ruleset type: the HOI4
+/// config points `type[scripted_loc]` at Stellaris's `game/common/scripted_loc`,
+/// so nothing under `common/scripted_localisation` is ever typed and every use
+/// of one read as an unknown command (#348). The node key is not checked — HOI4
+/// uses `defined_text`, and a game that spells it differently still names the
+/// definition in a `name` field.
+pub fn collect_scripted_loc_names(
+    file: &ParsedFile,
+    logical_path: &str,
+    table: &StringTable,
+) -> Vec<String> {
+    let dir = logical_path.replace('\\', "/").to_ascii_lowercase();
+    if !SCRIPTED_LOC_DIRS
+        .iter()
+        .any(|d| crate::path_contains_segment(&dir, d))
+    {
+        return Vec::new();
+    }
+    let arena = &file.arena;
+    let mut names = Vec::new();
+    for child in &file.root_children {
+        let Some(kc) = arena.keyed_clause(child) else {
+            continue;
+        };
+        if let Some(name) = field_value_from_children("name", kc.children, arena, table) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Shared implementation for base collection and the fused subtype path.
 /// When `subtype_hook` is present, each instance node of a subtype-declaring
 /// type invokes it during the same skip-root navigation. Per-key instance order
@@ -572,6 +615,7 @@ pub fn index_discovered_files(
         Vec<String>,                        // variable names
         HashMap<String, Vec<String>>,       // complex enum values
         HashMap<String, Vec<String>>,       // value set members
+        Vec<String>,                        // scripted-localisation names
     );
     let per_file: Vec<PerFileData> = files
         .into_par_iter()
@@ -619,6 +663,7 @@ pub fn index_discovered_files(
                 &file.logical_path,
                 table,
             );
+            let scripted_locs = collect_scripted_loc_names(&pf, &file.logical_path, table);
             (
                 path,
                 instances,
@@ -626,6 +671,7 @@ pub fn index_discovered_files(
                 var_names,
                 complex,
                 value_sets,
+                scripted_locs,
             )
         })
         .collect();
@@ -633,7 +679,9 @@ pub fn index_discovered_files(
     // Sequential merge in original file order — preserves TypeIndex.merge call
     // order so goto-def "first match" and refcount semantics are unchanged.
     let mut index = TypeIndex::new();
-    for (path, instances, subtype_instances, var_names, complex, value_sets) in per_file {
+    for (path, instances, subtype_instances, var_names, complex, value_sets, scripted_locs) in
+        per_file
+    {
         index.merge(&path, instances);
         if !subtype_instances.is_empty() {
             index.merge(&path, subtype_instances);
@@ -643,6 +691,7 @@ pub fn index_discovered_files(
         }
         index.complex_enum_values.merge_file(&path, complex);
         index.value_set_values.merge_file(&path, value_sets);
+        index.scripted_loc_index.merge_file(&path, scripted_locs);
     }
     index
 }
@@ -746,6 +795,85 @@ mod tests {
             (inst.location.line, inst.location.col),
             inst.location.end,
             "a multi-line definition has a non-degenerate span"
+        );
+    }
+
+    // ── Scripted localisations, collected by path (#348) ──────────────────────
+
+    const DEFINED_TEXT: &str = r#"
+defined_text = {
+	name = TUR_PKK_bases_name
+	text = { localization_key = a_key }
+}
+defined_text = {
+	name = "Western_Autocracy_L"
+	text = { localization_key = b_key }
+}
+"#;
+
+    fn scripted_locs_at(path: &str) -> Vec<String> {
+        let table = StringTable::new();
+        let parsed = parse_string(DEFINED_TEXT, &table);
+        collect_scripted_loc_names(&parsed, path, &table)
+    }
+
+    #[test]
+    fn scripted_loc_names_come_from_the_folder() {
+        assert_eq!(
+            scripted_locs_at("common/scripted_localisation/99_TUR.txt"),
+            vec!["TUR_PKK_bases_name", "Western_Autocracy_L"],
+            "the name field is the instance name, and quotes are stripped"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_folder_spellings_all_match() {
+        for dir in [
+            "common/scripted_localisation",
+            "common/scripted_localization",
+            "common/scripted_loc",
+        ] {
+            assert_eq!(
+                scripted_locs_at(&format!("{dir}/defs.txt")).len(),
+                2,
+                "{dir} must be recognised"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_loc_matches_whole_segments_only() {
+        // A filename carrying the word is not the folder, and neither is a
+        // longer directory that merely starts with it.
+        for path in [
+            "common/ideas/99_TUR_scripted_localization.txt",
+            "common/scripted_localisations/defs.txt",
+            "common/scripted_effects/00_effects.txt",
+        ] {
+            assert!(
+                scripted_locs_at(path).is_empty(),
+                "{path} must not be read as a scripted-loc folder"
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_loc_folder_nested_under_dlc_matches() {
+        // Same reason `path_contains_segment` exists: base-game content sits
+        // under `dlc/<id>/…` and must still be found.
+        assert_eq!(
+            scripted_locs_at("dlc/dlc042/common/scripted_localisation/defs.txt").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn scripted_loc_skips_a_definition_with_no_name() {
+        let table = StringTable::new();
+        let parsed = parse_string("defined_text = { text = { localization_key = a } }", &table);
+        assert!(
+            collect_scripted_loc_names(&parsed, "common/scripted_localisation/x.txt", &table)
+                .is_empty()
         );
     }
 }

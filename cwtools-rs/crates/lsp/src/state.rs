@@ -306,6 +306,9 @@ pub(crate) struct DocumentState {
     pub(crate) vanilla_file_paths: Mutex<Option<Vec<String>>>,
     /// Staged vanilla vars — see `VarIndex::vanilla_names` for provenance semantics.
     pub(crate) vanilla_var_names: Mutex<Option<Vec<String>>>,
+    /// Staged base-game scripted-localisation names, same provenance split as
+    /// `vanilla_var_names`. See `ScriptedLocIndex`.
+    pub(crate) vanilla_scripted_loc_names: Mutex<Option<Vec<String>>>,
     /// The base-game install's loc keys, hover text and definition sites, read
     /// from disk on the first loc rebuild and reused for the rest of the session
     /// (#89) — vanilla is ~2000 loc files that cannot change while the editor is
@@ -957,6 +960,7 @@ impl DocumentState {
             vanilla_loc_keys: Mutex::new(None),
             vanilla_file_paths: Mutex::new(None),
             vanilla_var_names: Mutex::new(None),
+            vanilla_scripted_loc_names: Mutex::new(None),
             vanilla_loc: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_key_index: parking_lot::RwLock::new(None),

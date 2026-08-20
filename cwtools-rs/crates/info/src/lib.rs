@@ -192,6 +192,12 @@ impl InfoService {
             cwtools_index::dynamic_values::collect_value_set_members(ruleset, ast, table),
         );
 
+        // ── Scripted localisations (path-driven, not rule-driven) ─────────────
+        self.type_index.scripted_loc_index.merge_file(
+            uri,
+            cwtools_index::collect_scripted_loc_names(ast, logical_path, table),
+        );
+
         // ── Rule-driven: type-instance index ─────────────────────────────────
         // Move the instances straight into the cross-file index. We don't keep a
         // second per-file copy on `FileInfo` (that doubled ~190K instances on
@@ -1476,6 +1482,37 @@ alias[effect:set_variable] = {
                 .value_set_values
                 .contains("country_flag", "my_flag"),
             "value_set member must be gone after clear_file"
+        );
+    }
+
+    /// The editor learns scripted localisations from the folder, not from a
+    /// ruleset type, and must drop a file's names when it re-indexes it (#348).
+    #[test]
+    fn scripted_locs_tracked_across_index_and_clear() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let mut rules = ast_to_ruleset(&parse_string("", &table), &table);
+        rules.reindex();
+
+        let mut svc = InfoService::new();
+        svc.index_file_with_path(
+            "f.txt",
+            &parse_string("defined_text = { name = Western_Autocracy_L }", &table),
+            &table,
+            &rules,
+            "common/scripted_localisation/f.txt",
+        );
+        assert!(
+            svc.type_index
+                .scripted_loc_index
+                .contains("western_autocracy_l"),
+            "the LSP index path must collect scripted localisations"
+        );
+
+        svc.clear_file("f.txt");
+        assert!(
+            svc.type_index.scripted_loc_index.is_empty(),
+            "clear_file must drop the file's names"
         );
     }
 }

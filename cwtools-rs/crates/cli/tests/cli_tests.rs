@@ -1669,6 +1669,11 @@ fn test_loc_parenthesised_expression_does_not_report_an_empty_command() {
         .stdout(predicate::str::contains("CW226").not());
 }
 
+/// `loc` reads the ruleset and the `.yml` files, never the game files, so it has
+/// no scripted-localisation registry and an unknown command tail could as easily
+/// be a `defined_text` as a typo — it stays lenient, the way a `?`-marked
+/// variable read already does (#348). What it can still judge is a scope link
+/// used from a scope that does not accept it.
 #[test]
 fn test_loc_with_rules_reports_the_command_checks() {
     cwtools()
@@ -1682,8 +1687,7 @@ fn test_loc_with_rules_reports_the_command_checks() {
         ])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("CW226"))
-        .stdout(predicate::str::contains("totally_unknown"))
+        .stdout(predicate::str::contains("CW226").not())
         .stdout(predicate::str::contains("CW260"))
         .stdout(predicate::str::contains(
             "controller used in wrong scope. In country but expected state",
@@ -1735,7 +1739,7 @@ fn test_loc_reads_game_and_rules_from_the_config() {
         .current_dir(tmp.path())
         .assert()
         .failure()
-        .stdout(predicate::str::contains("CW226"))
+        .stdout(predicate::str::contains("CW260"))
         .stderr(predicate::str::contains("applied: game, directory, rules"));
 }
 
