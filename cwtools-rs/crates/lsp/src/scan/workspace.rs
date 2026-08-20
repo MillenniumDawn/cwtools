@@ -28,7 +28,11 @@ use super::{
 
 /// ~one rayon work unit; 256 balances per-chunk rayon parallelism vs UI
 /// cancel/progress yield cadence on a 7k-file corpus.
+/// 2 in tests so three files cover before / mid / between without 257 files.
+#[cfg(not(test))]
 const PASS2_CHUNK_SIZE: usize = 256;
+#[cfg(test)]
+const PASS2_CHUNK_SIZE: usize = 2;
 
 impl Backend {
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
@@ -807,6 +811,8 @@ impl Backend {
                     .zip(inline_ignores.chunks(PASS2_CHUNK_SIZE)),
             )
         {
+            #[cfg(test)]
+            self.hold_pass2(crate::state::Pass2HoldPoint::Before);
             if cancel.is_cancelled() {
                 validate_ticker.stop();
                 return false;
@@ -817,6 +823,8 @@ impl Backend {
                 .zip(hashes_chunk.par_iter())
                 .zip(ignores_chunk.par_iter())
                 .filter_map(|(((file, parsed_opt), source_hash), inline_ignored)| {
+                    #[cfg(test)]
+                    self.hold_pass2(crate::state::Pass2HoldPoint::Mid);
                     if cancel.is_cancelled() {
                         return None;
                     }
@@ -854,6 +862,8 @@ impl Backend {
                 })
                 .collect();
             chunked_results.extend(chunk_results);
+            #[cfg(test)]
+            self.hold_pass2(crate::state::Pass2HoldPoint::After);
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
                 validate_ticker.stop();
@@ -1050,6 +1060,14 @@ impl Backend {
         true
     }
 
+    #[cfg(test)]
+    fn hold_pass2(&self, point: crate::state::Pass2HoldPoint) {
+        let gate = self.state.pass2_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.hold(point);
+        }
+    }
+
     /// Re-validate every currently-open document against the current (complete)
     /// index and re-publish, skipping any whose version changed meanwhile. Called
     /// once after the workspace scan so open docs validated against a partial
@@ -1192,5 +1210,195 @@ impl Backend {
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    use tower_lsp::lsp_types::Url;
+
+    use cwtools_rules::rules_types::{PathOptions, RuleSet, TypeDefinition};
+    use cwtools_validation::references::UsedInstances;
+
+    use crate::command_progress::CommandProgress;
+    use crate::state::{DocumentState, Pass2Gate, Pass2HoldPoint};
+
+    const SENTINEL_URI: &str = "sentinel://uses";
+    const SENTINEL_FP: (u64, u64) = (1, 1);
+    const SENTINEL_REV: u64 = 7;
+
+    fn test_backend() -> Backend {
+        let state = Arc::new(DocumentState::new());
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let slot = captured.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = tower_lsp::LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let client = captured.lock().take().unwrap();
+        Backend { client, state }
+    }
+
+    fn clone_backend(backend: &Backend) -> Backend {
+        Backend {
+            client: backend.client.clone(),
+            state: backend.state.clone(),
+        }
+    }
+
+    fn setup_workspace(gate: Option<Arc<Pass2Gate>>) -> (Backend, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let things = tmp.path().join("common/things");
+        std::fs::create_dir_all(&things).unwrap();
+        for (i, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+            std::fs::write(things.join(name), format!("thing_{i} = {{ }}\n")).unwrap();
+        }
+        let ws_uri = Url::from_file_path(tmp.path()).unwrap();
+        let backend = test_backend();
+        {
+            let mut cfg = backend.state.config.write();
+            cfg.workspace_uri = Some(ws_uri.as_str().into());
+            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(ws_uri.as_str()));
+        }
+        let mut ruleset = RuleSet::new();
+        ruleset.types.push(TypeDefinition {
+            name: "thing".to_string(),
+            name_field: None,
+            path_options: PathOptions {
+                paths: vec!["common/things".to_string()],
+                ..Default::default()
+            },
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: true,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        ruleset.reindex();
+        backend.state.rules.write().ruleset = Some(Arc::new(ruleset));
+        let mut uses = UsedInstances::default();
+        uses.mark("sentinel_type", "sentinel_instance");
+        backend
+            .state
+            .type_uses
+            .write()
+            .insert(SENTINEL_URI.to_string(), uses);
+        backend
+            .state
+            .type_uses_revision
+            .store(SENTINEL_REV, Ordering::Release);
+        *backend.state.last_scan_fingerprint.lock() = Some(SENTINEL_FP);
+        if let Some(gate) = gate {
+            *backend.state.pass2_gate.lock() = Some(gate);
+        }
+        (backend, tmp)
+    }
+
+    fn assert_stores_unchanged(backend: &Backend) {
+        assert!(
+            backend.state.type_uses.read().contains_key(SENTINEL_URI),
+            "cancelled pass 2 must not merge type_uses"
+        );
+        assert_eq!(
+            backend.state.type_uses_revision.load(Ordering::Acquire),
+            SENTINEL_REV,
+            "type_uses_revision must be unchanged on cancel"
+        );
+        assert_eq!(
+            *backend.state.last_scan_fingerprint.lock(),
+            Some(SENTINEL_FP),
+            "last_scan_fingerprint must be unchanged on cancel"
+        );
+    }
+
+    async fn wait_arrived(gate: &Pass2Gate, point: Pass2HoldPoint) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if gate.has_arrived() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pass 2 never reached {point:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn run_cancelled_at(point: Pass2HoldPoint) {
+        let gate = Pass2Gate::new(point);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (backend, _tmp) = setup_workspace(Some(gate.clone()));
+        let scan_backend = clone_backend(&backend);
+        let scan_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let progress = CommandProgress::for_tests(scan_backend.state.clone(), scan_cancel);
+            scan_backend
+                .validate_entire_workspace_tracked(false, Some(&progress))
+                .await
+        });
+        wait_arrived(&gate, point).await;
+        cancel.store(true, Ordering::Relaxed);
+        gate.release();
+        let outcome = handle.await.expect("scan panicked");
+        assert_eq!(outcome, ScanOutcome::Cancelled);
+        assert_stores_unchanged(&backend);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pass2_completed_scan_merges_type_uses() {
+        let (backend, _tmp) = setup_workspace(None);
+        let progress =
+            CommandProgress::for_tests(backend.state.clone(), Arc::new(AtomicBool::new(false)));
+        let outcome = backend
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        assert_eq!(outcome, ScanOutcome::Ran);
+        assert!(
+            !backend.state.type_uses.read().contains_key(SENTINEL_URI),
+            "a finished pass must merge type_uses and drop the sentinel"
+        );
+        assert!(
+            backend.state.type_uses_revision.load(Ordering::Acquire) > SENTINEL_REV,
+            "type_uses_revision must bump on a finished pass"
+        );
+        assert_ne!(
+            *backend.state.last_scan_fingerprint.lock(),
+            Some(SENTINEL_FP),
+            "last_scan_fingerprint must update on a finished pass"
+        );
+        assert!(
+            backend.state.last_scan_fingerprint.lock().is_some(),
+            "finished pass must record a fingerprint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pass2_cancel_before_first_chunk_skips_merge() {
+        run_cancelled_at(Pass2HoldPoint::Before).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pass2_cancel_mid_chunk_skips_merge() {
+        run_cancelled_at(Pass2HoldPoint::Mid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pass2_cancel_between_chunks_skips_merge() {
+        run_cancelled_at(Pass2HoldPoint::After).await;
     }
 }

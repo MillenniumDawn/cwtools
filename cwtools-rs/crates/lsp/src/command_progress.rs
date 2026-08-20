@@ -298,6 +298,18 @@ impl CommandProgress {
         }
     }
 
+    /// `ended` so Drop does not send a progress end.
+    #[cfg(test)]
+    pub(crate) fn for_tests(state: Arc<DocumentState>, flag: Arc<AtomicBool>) -> Self {
+        Self {
+            state,
+            sink: None,
+            key: None,
+            cancel: CancelFlag(Some(flag)),
+            ended: true,
+        }
+    }
+
     /// The flag to hand to the scan.
     pub(crate) fn cancel_flag(&self) -> CancelFlag {
         self.cancel.clone()
