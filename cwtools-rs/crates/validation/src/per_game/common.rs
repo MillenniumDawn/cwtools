@@ -155,5 +155,5 @@ fn check_duplicate_type_defs(ctx: &ValidationCtx, errors: &mut Vec<ValidationErr
 }
 
 fn find_matching_type<'a>(key: &str, ruleset: &'a RuleSet) -> Option<&'a TypeDefinition> {
-    ruleset.type_by_name.get(key).map(|&i| &ruleset.types[i])
+    ruleset.type_by_name().get(key).map(|&i| &ruleset.types[i])
 }

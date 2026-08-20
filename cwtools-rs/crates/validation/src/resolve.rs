@@ -39,7 +39,10 @@ pub(crate) fn find_type_and_rules<'a>(
     name: &str,
     ruleset: &'a RuleSet,
 ) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
-    let type_def = ruleset.type_by_name.get(name).map(|&i| &ruleset.types[i])?;
+    let type_def = ruleset
+        .type_by_name()
+        .get(name)
+        .map(|&i| &ruleset.types[i])?;
     let rules = find_rules_by_name(name, ruleset);
     Some((type_def, rules))
 }
@@ -98,7 +101,7 @@ pub(crate) fn find_rules_by_name<'a>(
     name: &str,
     ruleset: &'a RuleSet,
 ) -> &'a [(RuleType, Options)] {
-    if let Some(&i) = ruleset.type_rules_idx.get(name)
+    if let Some(&i) = ruleset.type_rules_idx().get(name)
         && let RootRule::TypeRule(_, (rule, _)) = &ruleset.root_rules[i]
         && let RuleType::NodeRule { rules, .. } = rule
     {
@@ -110,7 +113,7 @@ pub(crate) fn find_rules_by_name<'a>(
 /// The `Options` of a type's root rule (carries `## replace_scope` / `## push_scope`
 /// that seed the instance's scope, e.g. the state-history `state` object).
 pub(crate) fn find_type_rule_opts<'a>(name: &str, ruleset: &'a RuleSet) -> Option<&'a Options> {
-    let i = *ruleset.type_rules_idx.get(name)?;
+    let i = *ruleset.type_rules_idx().get(name)?;
     if let RootRule::TypeRule(_, (_, opts)) = &ruleset.root_rules[i] {
         Some(opts)
     } else {

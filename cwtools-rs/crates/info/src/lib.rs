@@ -172,7 +172,7 @@ impl InfoService {
         // ── Heuristic type-name set (kept for back-compat) ────────────────────
         // Use the pre-built type_by_name index from reindex() instead of
         // rebuilding a HashSet per file.
-        let type_names = &ruleset.type_by_name;
+        let type_names = ruleset.type_by_name();
         for child in &ast.root_children {
             Self::index_child_heuristic(child, &ast.arena, table, type_names, &mut info);
         }

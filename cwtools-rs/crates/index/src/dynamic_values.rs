@@ -263,7 +263,7 @@ pub fn collect_value_set_members(
     table: &StringTable,
 ) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    if ruleset.value_set_effects.is_empty() {
+    if ruleset.value_set_effects().is_empty() {
         return out;
     }
     collect_value_sets_in(&parsed.root_children, parsed, ruleset, table, &mut out);
@@ -320,7 +320,7 @@ pub(crate) fn value_set_leaf(
                 let mut key = buf.borrow_mut();
                 key.clear();
                 key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
-                ruleset.value_set_effects.get(key.as_str()).cloned()
+                ruleset.value_set_effects().get(key.as_str()).cloned()
             })
         })
         .flatten();
@@ -340,7 +340,7 @@ pub(crate) fn value_set_leaf(
                         let mut key = buf.borrow_mut();
                         key.clear();
                         key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
-                        ruleset.value_set_effect_fields.get(key.as_str()).cloned()
+                        ruleset.value_set_effect_fields().get(key.as_str()).cloned()
                     })
                 })
                 .flatten();

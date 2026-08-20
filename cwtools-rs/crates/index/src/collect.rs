@@ -454,7 +454,7 @@ fn collect_variables_and_value_sets(
     var_names_out: &mut Vec<String>,
     value_sets_out: &mut HashMap<String, Vec<String>>,
 ) {
-    let vs_active = !ruleset.value_set_effects.is_empty();
+    let vs_active = !ruleset.value_set_effects().is_empty();
     if var_effects.is_none() && !vs_active {
         return;
     }

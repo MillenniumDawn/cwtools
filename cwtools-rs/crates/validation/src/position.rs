@@ -1182,9 +1182,9 @@ mod tests {
             var_checks: false,
         };
         assert!(
-            ruleset.type_rules_idx.contains_key("foo"),
+            ruleset.type_rules_idx().contains_key("foo"),
             "{:#?}",
-            ruleset.type_rules_idx
+            ruleset.type_rules_idx()
         );
         assert!(!find_rules_by_name("foo", &ruleset).is_empty());
         assert!(
@@ -1221,7 +1221,7 @@ mod tests {
             &table,
         );
         let ruleset = ast_to_ruleset(&rules, &table);
-        assert!(ruleset.type_rules_idx.contains_key("foo"));
+        assert!(ruleset.type_rules_idx().contains_key("foo"));
         let registry = crate::build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
         let prepared = crate::Prepared {
             ruleset: &ruleset,

@@ -122,7 +122,7 @@ pub(crate) fn is_type_ref_leaf(
     type_name: &str,
     logical_path: &str,
 ) -> bool {
-    if !ruleset.type_reference_rules.is_empty() {
+    if !ruleset.type_reference_rules().is_empty() {
         return ruleset
             .type_reference_rules_for_key(leaf_key)
             .is_some_and(|entries| {
@@ -133,7 +133,7 @@ pub(crate) fn is_type_ref_leaf(
                     match &entry.root_type {
                         None => true,
                         Some(root_type) => ruleset
-                            .type_by_name
+                            .type_by_name()
                             .get(root_type)
                             .map(|&idx| {
                                 cwtools_info::check_path_dir(
@@ -159,7 +159,7 @@ pub(crate) fn is_type_ref_leaf(
         // For TypeRules, check path filter
         if let RootRule::TypeRule(..) = root_rule
             && let Some(name) = rule_type_name
-            && let Some(&idx) = ruleset.type_by_name.get(name)
+            && let Some(&idx) = ruleset.type_by_name().get(name)
         {
             let td = &ruleset.types[idx];
             if !cwtools_info::check_path_dir(&td.path_options, logical_path) {

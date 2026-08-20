@@ -104,7 +104,7 @@ impl UsedInstances {
 pub(crate) fn is_tracked(ruleset: &RuleSet, game: Option<Game>, type_name: &str) -> bool {
     is_tracked_technology(game, type_name)
         || ruleset
-            .type_by_name
+            .type_by_name()
             .get(type_name)
             .is_some_and(|&i| ruleset.types[i].should_be_referenced)
 }

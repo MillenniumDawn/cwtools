@@ -122,11 +122,11 @@ fn test_parse_real_cwt() {
 
     // The ruleset index should have been built, so name lookups work.
     assert!(
-        ruleset.type_by_name.contains_key("ship_size"),
+        ruleset.type_by_name().contains_key("ship_size"),
         "type_by_name index missing ship_size"
     );
     assert!(
-        ruleset.enum_by_name.contains_key("shipsize_class"),
+        ruleset.enum_by_name().contains_key("shipsize_class"),
         "enum_by_name index missing shipsize_class"
     );
 }
@@ -182,7 +182,7 @@ fn test_parse_stellaris_ethics() {
 
     // The type and enum indexes should have been populated.
     assert!(
-        ruleset.type_by_name.contains_key("ethos"),
+        ruleset.type_by_name().contains_key("ethos"),
         "type_by_name index missing ethos"
     );
 

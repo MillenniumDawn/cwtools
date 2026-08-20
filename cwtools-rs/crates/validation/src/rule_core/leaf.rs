@@ -463,7 +463,7 @@ pub(super) fn validate_leaf(
             )
             .with_end(leaf.pos.end);
             if let NewField::ValueField(ValueType::Enum(enum_name)) = right
-                && let Some(&idx) = ctx.ruleset.enum_by_name.get(enum_name)
+                && let Some(&idx) = ctx.ruleset.enum_by_name().get(enum_name)
                 && let Some(cand) = best_suggestion(
                     actual
                         .strip_prefix('"')
